@@ -150,47 +150,70 @@ struct
   let add a b = node (T.add a.value b.value) (Add (a, b)) [ a; b ]
 
   (* TODO [Phase 2, easy]: follow [add]. *)
-  let sub a b = Todo.todo "Var.sub"
-  let mul a b = Todo.todo "Var.mul"
-  let div a b = Todo.todo "Var.div"
-  let neg a = Todo.todo "Var.neg"
-  let scale k a = Todo.todo "Var.scale"
-  let pow a p = Todo.todo "Var.pow"
-  let exp a = Todo.todo "Var.exp"
-  let log a = Todo.todo "Var.log"
-  let matmul a b = Todo.todo "Var.matmul"
-  let transpose a = Todo.todo "Var.transpose"
-  let reshape a new_shape = Todo.todo "Var.reshape"
-  let sum a = Todo.todo "Var.sum"
-  let mean a = Todo.todo "Var.mean"
+  let sub a b = node (T.sub a.value b.value) (Sub (a, b)) [ a; b ]
+  let mul a b = node (T.mul a.value b.value) (Mul (a, b)) [ a; b ]
+  let div a b = node (T.div a.value b.value) (Div (a, b)) [ a; b ]
+  let neg a = node (T.neg a.value) (Neg a) [ a ]
+  let scale k a = node (T.scale k a.value) (Scale (k, a)) [ a ]
+  let pow a p = node (T.pow a.value p) (Pow (a, p)) [ a ]
+  let exp a = node (T.exp a.value) (Exp a) [ a ]
+  let log a = node (T.log a.value) (Log a) [ a ]
+  let matmul a b = node (T.matmul a.value b.value) (Matmul (a, b)) [ a; b ]
+  let transpose a = node (T.transpose a.value) (Transpose a) [ a ]
+  let reshape a new_shape = node (T.reshape a.value new_shape) (Reshape a) [ a ]
+  let sum a = node (T.sum a.value) (Sum a) [ a ]
+  let mean a = node (T.mean a.value) (Mean a) [ a ]
 
   (* TODO [Phase 2, easy]: normalise a negative axis (axis + ndim) before
      storing it in [Sum_axis], so backward never has to think about it. *)
-  let sum_axis ?(keepdims = false) a axis = Todo.todo "Var.sum_axis"
+  let sum_axis ?(keepdims = false) a axis =
+    let axis = if axis < 0 then axis + T.ndim a.value else axis in
+    node (T.sum_axis ~keepdims a.value axis) (Sum_axis (a, axis)) [ a ]
 
   (* TODO [Phase 2, easy]: value = T.map (fun x -> Float.max x 0.0). *)
-  let relu a = Todo.todo "Var.relu"
+  let relu a = node (T.map (fun x -> Float.max x 0.0) a.value) (Relu a) [ a ]
 
   (* TODO [Phase 2, easy]: 1 / (1 + e^-x). For a numerically stable version
      use e^x / (1 + e^x) when x < 0, so you never compute e^(large). *)
-  let sigmoid a = Todo.todo "Var.sigmoid"
+  let sigmoid a =
+    let stable x =
+      if x >= 0. then 1. /. (1. +. Float.exp (-.x))
+      else
+        let e = Float.exp x in
+        e /. (1. +. e)
+    in
+    node (T.map stable a.value) (Sigmoid a) [ a ]
 
   (* TODO [Phase 2, easy]: T.map Float.tanh. *)
-  let tanh a = Todo.todo "Var.tanh"
+  let tanh a = node (T.map Float.tanh a.value) (Tanh a) [ a ]
 
   (* TODO [Phase 2, medium]: log_softmax along the last axis, stably:
        m   = max_axis ~keepdims:true x (-1)
        out = x - m - log (sum_axis ~keepdims:true (exp (x - m)) (-1))
      All of this is tensor-level work (T functions) producing ONE node; do not build
      it out of Var ops, or backward gets slower and less stable. *)
-  let log_softmax a = Todo.todo "Var.log_softmax"
+  let log_softmax a =
+    let x = a.value in
+    let m = T.max_axis ~keepdims:true x (-1) in
+    (* [B; 1] row maxima *)
+    let shifted = T.sub x m in
+    (* [B; C] largest entry per row is 0 *)
+    let lse = T.log (T.sum_axis ~keepdims:true (T.exp shifted) (-1)) in
+    (* [B; 1] *)
+    node (T.sub shifted lse) (Log_softmax a) [ a ]
 
   (* TODO [Phase 6]: value = T.im2col; record the conv parameters in the op. *)
-  let im2col a ~kh ~kw ~stride ~padding = Todo.todo "Var.im2col"
+  let im2col a ~kh ~kw ~stride ~padding =
+    node
+      (T.im2col a.value ~kh ~kw ~stride ~padding)
+      (Im2col { input = a; kh; kw; stride; padding })
+      [ a ]
 
   (* TODO [Phase 6]: T.max_pool2d returns (value, argmax); keep argmax in the
      op for backward. *)
-  let max_pool2d a ~size ~stride = Todo.todo "Var.max_pool2d"
+  let max_pool2d a ~size ~stride =
+    let value, argmax = T.max_pool2d a.value ~size ~stride in
+    node value (Max_pool2d { input = a; argmax }) [ a ]
 
   (* ---------------------------------------------------------------------- *)
   (* Backward pass                                                           *)
@@ -213,58 +236,96 @@ struct
      Optional optimisation: skip the work for an input whose
      [requires_grad] is false. *)
   let propagate v g =
+    (* [acc x f] only computes the gradient [f ()] if [x] actually needs one,
+       e.g. skipping d/dX of a matmul whose X is a constant input batch. *)
+    let acc x f = if x.requires_grad then accumulate x (f ()) in
+    (* For broadcasting binary ops: reduce back to the input's shape. *)
+    let acc_bcast x f =
+      acc x (fun () -> T.sum_to_shape (f ()) (T.shape x.value))
+    in
+    let out = v.value in
     match v.op with
     | Leaf -> ()
     | Add (a, b) ->
         (* worked example: d(a+b)/da = d(a+b)/db = 1 *)
         accumulate a (T.sum_to_shape g (T.shape a.value));
         accumulate b (T.sum_to_shape g (T.shape b.value))
-    (* TODO [Phase 2, easy]  Sub: da = g, db = -g *)
-    | Sub _ -> Todo.todo "backward Sub"
-    (* TODO [Phase 2, easy]  Mul: da = g * b, db = g * a *)
-    | Mul _ -> Todo.todo "backward Mul"
-    (* TODO [Phase 2, easy]  Div: da = g / b, db = -g * a / b^2 *)
-    | Div _ -> Todo.todo "backward Div"
-    (* TODO [Phase 2, easy]  Neg: da = -g;  Scale: da = k * g *)
-    | Neg _ -> Todo.todo "backward Neg"
-    | Scale _ -> Todo.todo "backward Scale"
-    (* TODO [Phase 2, easy]  Pow: da = g * p * a^(p-1) *)
-    | Pow _ -> Todo.todo "backward Pow"
-    (* TODO [Phase 2, easy]  Exp: da = g * out  (reuse the forward value!) *)
-    | Exp _ -> Todo.todo "backward Exp"
-    (* TODO [Phase 2, easy]  Log: da = g / a *)
-    | Log _ -> Todo.todo "backward Log"
-    (* TODO [Phase 2, medium]  Matmul (out = a @ b):
-         da = g @ transpose b      db = transpose a @ g
-       Sanity-check the shapes on paper: [m;k] x [k;n]. *)
-    | Matmul _ -> Todo.todo "backward Matmul"
-    (* TODO [Phase 2, easy]  Transpose: da = transpose g *)
-    | Transpose _ -> Todo.todo "backward Transpose"
-    (* TODO [Phase 2, easy]  Reshape: da = reshape g (shape of a) *)
-    | Reshape _ -> Todo.todo "backward Reshape"
-    (* TODO [Phase 2, easy]  Sum: g is a scalar; da = broadcast_to g (shape a)
-                             Mean: same, divided by numel a *)
-    | Sum _ -> Todo.todo "backward Sum"
-    | Mean _ -> Todo.todo "backward Mean"
-    (* TODO [Phase 2, medium]  Sum_axis (a, axis): g lacks [axis] (unless
-       keepdims was used). Reshape g to a's shape with a.shape.(axis) replaced
-       by 1, then broadcast_to a's shape. *)
-    | Sum_axis _ -> Todo.todo "backward Sum_axis"
-    (* TODO [Phase 2, easy]  Relu: da = g where a > 0, else 0 (T.map2) *)
-    | Relu _ -> Todo.todo "backward Relu"
-    (* TODO [Phase 2, easy]  Sigmoid: da = g * out * (1 - out) *)
-    | Sigmoid _ -> Todo.todo "backward Sigmoid"
-    (* TODO [Phase 2, easy]  Tanh: da = g * (1 - out^2) *)
-    | Tanh _ -> Todo.todo "backward Tanh"
-    (* TODO [Phase 2, medium]  Log_softmax along the last axis:
+    (* Sub: da = g, db = -g *)
+    | Sub (a, b) ->
+        acc_bcast a (fun () -> g);
+        acc_bcast b (fun () -> T.neg g)
+    (* Mul: da = g * b, db = g * a  (each input gets the OTHER one) *)
+    | Mul (a, b) ->
+        acc_bcast a (fun () -> T.mul g b.value);
+        acc_bcast b (fun () -> T.mul g a.value)
+    (* Div: da = g / b, db = -g * a / b^2 *)
+    | Div (a, b) ->
+        acc_bcast a (fun () -> T.div g b.value);
+        acc_bcast b (fun () ->
+            T.neg (T.div (T.mul g a.value) (T.mul b.value b.value)))
+    (* Neg: da = -g;  Scale: da = k * g  (unary, so no shape reduction) *)
+    | Neg a -> acc a (fun () -> T.neg g)
+    | Scale (k, a) -> acc a (fun () -> T.scale k g)
+    (* Pow: da = g * p * a^(p-1) *)
+    | Pow (a, p) ->
+        acc a (fun () -> T.mul (T.scale p g) (T.pow a.value (p -. 1.)))
+    (* Exp: da = g * out  (reuse the forward value) *)
+    | Exp a -> acc a (fun () -> T.mul g out)
+    (* Log: da = g / a *)
+    | Log a -> acc a (fun () -> T.div g a.value)
+    (* Matmul (out = a @ b), [m;k] x [k;n] -> [m;n]:
+         da = g @ transpose b   : [m;n] x [n;k] -> [m;k]
+         db = transpose a @ g   : [k;m] x [m;n] -> [k;n] *)
+    | Matmul (a, b) ->
+        acc a (fun () -> T.matmul g (T.transpose b.value));
+        acc b (fun () -> T.matmul (T.transpose a.value) g)
+    (* Transpose: da = transpose g *)
+    | Transpose a -> acc a (fun () -> T.transpose g)
+    (* Reshape: da = reshape g (shape of a) *)
+    | Reshape a -> acc a (fun () -> T.reshape g (T.shape a.value))
+    (* Sum: g is a scalar; da = broadcast_to g (shape a)
+       Mean: same, divided by numel a *)
+    | Sum a -> acc a (fun () -> T.broadcast_to g (T.shape a.value))
+    | Mean a ->
+        acc a (fun () ->
+            let n = float_of_int (T.numel a.value) in
+            T.scale (1. /. n) (T.broadcast_to g (T.shape a.value)))
+    (* Sum_axis (a, axis): g lacks [axis] (unless keepdims was used). Reshape
+       g to a's shape with that axis set to 1, then broadcast back. The
+       reshape works in both cases since the element count is the same. *)
+    | Sum_axis (a, axis) ->
+        acc a (fun () ->
+            let a_shape = T.shape a.value in
+            let kept = Array.copy a_shape in
+            kept.(axis) <- 1;
+            T.broadcast_to (T.reshape g kept) a_shape)
+    (* Relu: da = g where a > 0, else 0 *)
+    | Relu a ->
+        acc a (fun () ->
+            T.map2 (fun x gi -> if x > 0. then gi else 0.) a.value g)
+    (* Sigmoid: da = g * out * (1 - out) *)
+    | Sigmoid a ->
+        acc a (fun () -> T.mul g (T.map (fun s -> s *. (1. -. s)) out))
+    (* Tanh: da = g * (1 - out^2) *)
+    | Tanh a ->
+        acc a (fun () -> T.mul g (T.map (fun t -> 1. -. (t *. t)) out))
+    (* Log_softmax along the last axis:
          softmax = exp out
-         da = g - softmax * sum_axis ~keepdims:true g (-1)
-       Derive it once on paper; it's a classic interview question. *)
-    | Log_softmax _ -> Todo.todo "backward Log_softmax"
-    (* TODO [Phase 6]  Im2col: da = T.col2im g ~input_shape:(shape of input) ... *)
-    | Im2col _ -> Todo.todo "backward Im2col"
-    (* TODO [Phase 6]  Max_pool2d: da = T.max_pool2d_backward ~grad_out:g ... *)
-    | Max_pool2d _ -> Todo.todo "backward Max_pool2d"
+         da = g - softmax * sum_axis ~keepdims:true g (-1) *)
+    | Log_softmax a ->
+        acc a (fun () ->
+            let softmax = T.exp out in
+            T.sub g (T.mul softmax (T.sum_axis ~keepdims:true g (-1))))
+    (* Im2col: scatter-add the column gradients back to the input. *)
+    | Im2col { input; kh; kw; stride; padding } ->
+        acc input (fun () ->
+            T.col2im g ~input_shape:(T.shape input.value) ~kh ~kw ~stride
+              ~padding)
+    (* Max_pool2d: route each output's gradient to its window's winner. *)
+    | Max_pool2d { input; argmax } ->
+        acc input (fun () ->
+            T.max_pool2d_backward ~grad_out:g ~argmax
+              ~input_shape:(T.shape input.value))
 
   (* TODO [Phase 2, medium]: return every node reachable from [root] in
      topological order: each node appears AFTER all of its [parents].
@@ -274,7 +335,19 @@ struct
        them needs a gradient.
      - Deep graphs (e.g. RNNs) can overflow the stack with naive recursion;
        an explicit stack is a good follow-up but not needed for MLPs/CNNs. *)
-  let topo_sort root = Todo.todo "Var.topo_sort"
+  let topo_sort root =
+    let seen = Hashtbl.create 64 in
+    let order = ref [] in
+    let rec visit v =
+      if v.requires_grad && not (Hashtbl.mem seen v.id) then begin
+        Hashtbl.add seen v.id ();
+        List.iter visit (parents v);
+        order := v :: !order
+      end
+    in
+    visit root;
+    (* [order] was built by prepending, so it is reversed: put parents first. *)
+    List.rev !order
 
   (* TODO [Phase 2, medium]:
      1. Raise [Invalid_argument] unless [T.numel root.value = 1]; gradients
@@ -284,7 +357,17 @@ struct
         grad is [Some g], call [propagate node g].
      Because of the ordering, a node's grad is complete (all its consumers
      have contributed) before it is propagated further. *)
-  let backward root = Todo.todo "Var.backward"
+  let backward root =
+    if T.numel root.value <> 1 then
+      invalid_arg
+        (Printf.sprintf
+           "Var.backward: expected a scalar output, got %d elements"
+           (T.numel root.value));
+    accumulate root (T.ones (shape root));
+    (* Outputs first: reverse of topological order. *)
+    List.iter
+      (fun v -> match v.grad with Some g -> propagate v g | None -> ())
+      (List.rev (topo_sort root))
 
   module Infix = struct
     let ( + ) = add
