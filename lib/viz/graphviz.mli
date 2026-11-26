@@ -1,4 +1,4 @@
-(** Export a computational graph to Graphviz DOT format (stretch goal).
+(** Export a computational graph to Graphviz DOT format.
 
     Render with: [dot -Tsvg graph.dot -o graph.svg] *)
 

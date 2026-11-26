@@ -1,13 +1,15 @@
-(* Phase 4: optimizers. Run with: dune exec test/test_optim.exe *)
+(* Optimizers, checked against hand-computed updates.
+   Run with: dune exec test/test_optim.exe *)
 
 open Flockml
 open OUnit2
 open Helpers
 
-(* loss = sum((x - target)^2) *)
+(** [sum ((x - target)²)]: gradient [2 (x - target)], minimum at [target]. *)
 let quadratic ?(target = 0.0) x =
   Var.sum (Var.pow (Var.sub x (Var.scalar target)) 2.0)
 
+(** Take [steps] optimizer steps on {!quadratic}. *)
 let run opt x ~steps ~target =
   for _ = 1 to steps do
     Optim.zero_grad opt;

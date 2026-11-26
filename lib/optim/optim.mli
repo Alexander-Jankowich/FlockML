@@ -5,6 +5,8 @@
     parameter's tensor {e in place} from its gradient. *)
 
 type t
+(** An optimizer bound to a fixed list of parameters, with its per-parameter
+    state. *)
 
 val sgd : ?momentum:float -> ?weight_decay:float -> lr:float -> Var.t list -> t
 (** Stochastic gradient descent, optionally with (PyTorch-style) momentum: v <-
@@ -29,6 +31,7 @@ val zero_grad : t -> unit
 (** Clear every parameter's gradient. Call before each backward pass. *)
 
 val lr : t -> float
+(** The current learning rate. *)
 
 val set_lr : t -> float -> unit
 (** For learning-rate schedules (e.g. step decay between epochs). *)

@@ -1,4 +1,5 @@
-(* Phase 1: Tensor. Run with: dune exec test/test_tensor.exe *)
+(* Tensor backend: construction, broadcasting, reductions, linear algebra and
+   in-place ops. Run with: dune exec test/test_tensor.exe *)
 
 open Flockml
 open OUnit2

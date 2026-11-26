@@ -1,4 +1,4 @@
-(* Phases 3 and 5: init, losses, layers, data, metrics.
+(* Neural-network building blocks: init, losses, layers, data, metrics.
    Run with: dune exec test/test_nn.exe *)
 
 open Flockml

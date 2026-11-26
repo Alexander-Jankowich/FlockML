@@ -1,16 +1,17 @@
+(** The highest-scoring class of each row. *)
 let predict scores = Tensor.argmax_axis scores 1
 
-(* TODO [Phase 5, easy]: count matches / length. Raise Invalid_argument on a
-   length mismatch, and decide what an empty input should return. *)
+(** Raise [Invalid_argument] (naming function [fn]) unless [predictions] and
+    [labels] have the same length. *)
 let check_lengths ~fn ~predictions ~labels =
   let np = Array.length predictions and nl = Array.length labels in
   if np <> nl then
     invalid_arg
       (Printf.sprintf "Metrics.%s: %d predictions but %d labels" fn np nl)
 
-(* Empty input returns [nan]: accuracy of zero examples is 0/0, undefined.
-   Returning 0.0 would make an empty eval set look like a terrible model, and
-   1.0 like a perfect one; nan is impossible to mistake for a real score. *)
+(** Empty input returns [nan]: accuracy of zero examples is 0/0, undefined.
+    Returning 0.0 would make an empty eval set look like a terrible model, and
+    1.0 like a perfect one; [nan] is impossible to mistake for a real score. *)
 let accuracy ~predictions ~labels =
   check_lengths ~fn:"accuracy" ~predictions ~labels;
   let n = Array.length labels in
@@ -23,9 +24,10 @@ let accuracy ~predictions ~labels =
     float_of_int !correct /. float_of_int n
   end
 
-(* TODO [Phase 5, easy]: Array.make_matrix num_classes num_classes 0, then
-   increment m.(labels.(i)).(predictions.(i)) for every i. The diagonal is the
-   correct predictions; off-diagonal cells show which digits get confused. *)
+(** Count each (true, predicted) pair. The diagonal holds the correct
+    predictions; off-diagonal cells show which classes get confused. Raises
+    [Invalid_argument] on a length mismatch or a class that is negative or at
+    least [num_classes]. *)
 let confusion_matrix ~num_classes ~predictions ~labels =
   check_lengths ~fn:"confusion_matrix" ~predictions ~labels;
   let in_range c = c >= 0 && c < num_classes in
@@ -44,6 +46,7 @@ let confusion_matrix ~num_classes ~predictions ~labels =
     labels;
   m
 
+(** One row per true class, one column per predicted class. *)
 let pp_confusion_matrix fmt m =
   let n = Array.length m in
   Format.fprintf fmt "@[<v>true\\pred";

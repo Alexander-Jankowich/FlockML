@@ -1,3 +1,4 @@
+(** A layer or model; see the interface for each constructor. *)
 type t =
   | Linear of { w : Var.t; b : Var.t }
   | Conv2d of {
@@ -16,9 +17,10 @@ type t =
   | Sequential of t list
 
 (* ------------------------------------------------------------------------ *)
-(* Constructors (provided; they depend on your Init functions)              *)
+(* Constructors                                                             *)
 (* ------------------------------------------------------------------------ *)
 
+(** Weights use He initialisation (suited to ReLU); biases start at zero. *)
 let linear ?rng ~in_dim ~out_dim () =
   Linear
     {
@@ -26,6 +28,9 @@ let linear ?rng ~in_dim ~out_dim () =
       b = Var.param (Tensor.zeros [| out_dim |]);
     }
 
+(** Weights are stored pre-flattened as [[| kernel * kernel * in_c; out_c |]]
+    (the layout {!Tensor.im2col} produces), He-initialised; biases start at
+    zero. *)
 let conv2d ?rng ?(stride = 1) ?(padding = 0) ~in_channels ~out_channels ~kernel
     () =
   let fan_in = kernel * kernel * in_channels in
@@ -56,21 +61,14 @@ let sequential layers = Sequential layers
 (* Forward pass                                                              *)
 (* ------------------------------------------------------------------------ *)
 
-(* TODO [Phase 3, medium]: one case per constructor.
-   - Linear:     Var.add (Var.matmul x w) b      (b broadcasts over the batch)
-   - Relu / Sigmoid / Tanh: the matching Var function.
-   - Flatten:    Var.reshape x [| n; numel / n |] where n = (Var.shape x).(0).
-   - Sequential: List.fold_left, feeding each layer's output to the next
-                 (pass ~train and ?rng down when you recurse).
-   - Dropout p:  if not train, return x unchanged. Otherwise build a constant
-                 mask tensor with 1/(1-p) where (uniform > p) and 0 elsewhere
-                 ("inverted dropout", so eval needs no rescaling) and multiply.
-   - Conv2d [Phase 6]: input [n; h; w; c]
-       cols = Var.im2col x ~kh:kernel ~kw:kernel ~stride ~padding
-       out  = Var.add (Var.matmul cols w) b          [n*oh*ow; out_c]
-       then Var.reshape out [| n; oh; ow; out_c |]
-       with oh = (h + 2*padding - kernel) / stride + 1 (same for ow).
-   - Max_pool2d [Phase 6]: Var.max_pool2d x ~size ~stride. *)
+(** One pattern match over the layer type. Every case is built from Var ops,
+    so no layer needs backward code of its own.
+    - [Linear]: [x @ w + b], with [b] broadcast over the batch.
+    - [Conv2d]: im2col turns each output pixel's receptive field into a row,
+      one matmul applies every filter to every patch, and a reshape restores
+      NHWC.
+    - [Dropout]: inverted dropout, so evaluation needs no rescaling.
+    - [Sequential]: a left fold, passing [train] and [rng] down. *)
 let rec forward ?(train = false) ?rng layer x =
   match layer with
   | Linear r -> Var.add (Var.matmul x r.w) r.b
@@ -116,8 +114,8 @@ let rec forward ?(train = false) ?rng layer x =
       (* Feed each layer's output into the next, threading train/rng down. *)
       List.fold_left (fun acc layer -> forward ~train ?rng layer acc) x layers
 
-(* TODO [Phase 3, easy]: collect [w; b] from Linear and Conv2d, recurse into
-   Sequential (List.concat_map), and [] for everything else. *)
+(** [[w; b]] for Linear and Conv2d, concatenated in order for Sequential, and
+    nothing for the parameter-free layers. *)
 let rec params = function
   | Linear r -> [ r.w; r.b ]
   | Conv2d r -> [ r.w; r.b ]
@@ -125,14 +123,16 @@ let rec params = function
   | _ -> []
 
 (* ------------------------------------------------------------------------ *)
-(* Utilities (provided)                                                      *)
+(* Utilities                                                                *)
 (* ------------------------------------------------------------------------ *)
 
+(** Sum of the element counts of every parameter. *)
 let num_params layer =
   List.fold_left
     (fun acc p -> acc + Array.fold_left ( * ) 1 (Var.shape p))
     0 (params layer)
 
+(** Indent nested Sequential layers by two spaces per level. *)
 let rec to_string = function
   | Linear { w; _ } ->
       let s = Var.shape w in

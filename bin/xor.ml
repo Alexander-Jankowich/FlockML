@@ -1,4 +1,4 @@
-(* The smallest end-to-end test of the whole stack: learn XOR with a 2-8-1
+(** The smallest end-to-end test of the whole stack: learn XOR with a 2-8-1
    MLP. Linear models can't solve XOR, so success here means tensors,
    autograd, layers, the loss and the optimizer all work together.
 
@@ -31,9 +31,8 @@ let () =
     Optim.step opt;
     if epoch mod 100 = 0 then
       Printf.printf "epoch %4d  loss %.6f\n%!" epoch
-        (Tensor.item (Var.value loss))
-    (* Once Graphviz.to_dot is done, uncomment to see the graph:
-       if epoch = 1 then Graphviz.save_dot "xor_graph.dot" loss; *)
+        (Tensor.item (Var.value loss));
+    if epoch = 1 then Graphviz.save_dot "xor_graph.dot" loss
   done;
   Format.printf "predictions:@.%a@." Tensor.pp
     (Var.value (Layer.forward model x))

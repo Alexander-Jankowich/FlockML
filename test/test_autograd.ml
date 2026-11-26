@@ -1,4 +1,5 @@
-(* Phase 2: autograd. Run with: dune exec test/test_autograd.exe *)
+(* Autograd: graph mechanics and a gradient check for every differentiable op.
+   Run with: dune exec test/test_autograd.exe *)
 
 open Flockml
 open OUnit2
@@ -53,7 +54,10 @@ let mechanics =
            assert_tensor (t [| 1; 2 |] [| 0.; -1000. |]) lp );
        ]
 
+(** Shorthand for {!Helpers.rand_tensor}: uniform samples in [[-1, 1)]. *)
 let r = rand_tensor
+
+(** Strictly positive samples, for ops undefined at or below 0 (log, div). *)
 let pos shape = rand_tensor ~lo:0.5 ~hi:2.0 shape
 
 let gradchecks =

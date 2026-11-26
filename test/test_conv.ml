@@ -1,10 +1,12 @@
-(* Phase 6 (stretch): convolution, pooling and graph export.
+(* Convolution, pooling and graph export.
    Run with: dune exec test/test_conv.exe *)
 
 open Flockml
 open OUnit2
 open Helpers
 
+(** The inner product of two same-sized tensors, for the adjoint test
+    [<im2col x, y> = <x, col2im y>]. *)
 let dot a b =
   let a = Tensor.to_array a and b = Tensor.to_array b in
   let s = ref 0.0 in
@@ -57,6 +59,7 @@ let tensor_level =
            assert_equal [| 5; 7; 13; 15 |] argmax );
        ]
 
+(** Shorthand for {!Helpers.rand_tensor}. *)
 let r = rand_tensor
 
 let gradchecks =

@@ -1,6 +1,7 @@
-(* Optimizer state as an ADT: one constructor per algorithm, each carrying
-   one state tensor per parameter (same index as [params]). *)
+(** Optimizer state as an ADT: one constructor per algorithm, each carrying
+    one state tensor per parameter (same index as [params]). *)
 
+(** State for SGD with optional momentum and weight decay. *)
 type sgd = {
   mutable lr : float;
   momentum : float;
@@ -8,6 +9,7 @@ type sgd = {
   velocity : Tensor.t array;
 }
 
+(** State for Adam. *)
 type adam = {
   mutable lr : float;
   beta1 : float;
@@ -19,13 +21,18 @@ type adam = {
   mutable t : int;  (** number of steps taken, for bias correction *)
 }
 
+(** Which algorithm, with its state. *)
 type kind = Sgd of sgd | Adam of adam
+
+(** An optimizer: the parameters it updates and its algorithm. *)
 type t = { params : Var.t array; kind : kind }
 
 (* ------------------------------------------------------------------------ *)
-(* Construction and bookkeeping (provided)                                   *)
+(* Construction and bookkeeping                                              *)
 (* ------------------------------------------------------------------------ *)
 
+(** One zero tensor per parameter, matching its shape: the initial
+    per-parameter state (velocity, moments). *)
 let zeros_like_params params =
   Array.map (fun p -> Tensor.zeros (Var.shape p)) params
 
@@ -70,15 +77,11 @@ let set_lr opt lr =
 (* Update rules                                                              *)
 (* ------------------------------------------------------------------------ *)
 
-(* TODO [Phase 4, easy-medium]: for each index i with Var.grad params.(i) =
-   Some g (skip None):
-     p = Var.value params.(i)        (mutate this tensor in place!)
-     if weight_decay > 0:  g <- g + weight_decay * p   (don't mutate the
-                                                        stored grad; copy)
-     if momentum = 0:      p <- p - lr * g             (Tensor.axpy_)
-     else:                 v <- momentum * v + g       (Tensor.scale_, add_)
-                           p <- p - lr * v
-   Check with the hand-computed numbers in test/test_optim.ml. *)
+(** One SGD update of every parameter that has a gradient, in place:
+    - weight decay: [g <- g + weight_decay * p] (on a copy, never the stored
+      gradient);
+    - plain: [p <- p - lr * g];
+    - with momentum: [v <- momentum * v + g], then [p <- p - lr * v]. *)
 let sgd_step params (s : sgd) =
   Array.iteri
     (fun i param ->
@@ -107,18 +110,18 @@ let sgd_step params (s : sgd) =
           end)
     params
 
-(* TODO [Phase 4, medium]: Adam.
-     t <- t + 1                                  (once per step, not per param)
-     for each param with a gradient g:
-       (weight decay as in SGD)
-       m <- beta1 * m + (1 - beta1) * g
-       v <- beta2 * v + (1 - beta2) * g^2
-       m_hat = m / (1 - beta1^t)                 (bias correction: m and v
-       v_hat = v / (1 - beta2^t)                  start at 0, so early
-       p <- p - lr * m_hat / (sqrt v_hat + eps)   estimates are too small)
-   Store m, v back with Tensor.blit_ (or update them in place directly).
-   Nice property for testing: on step 1, m_hat / sqrt v_hat = sign(g), so
-   every parameter moves by almost exactly lr. *)
+(** One Adam update of every parameter that has a gradient, in place:
+    {v
+      t <- t + 1                       (once per step, shared by all params)
+      m <- beta1 * m + (1 - beta1) * g
+      v <- beta2 * v + (1 - beta2) * g^2
+      m_hat = m / (1 - beta1^t)        (bias correction: m and v start at 0)
+      v_hat = v / (1 - beta2^t)
+      p <- p - lr * m_hat / (sqrt v_hat + eps)
+    v}
+    Weight decay is applied to [g] first, as in SGD. On the first step
+    [m_hat / sqrt v_hat = sign g], so every parameter moves by almost exactly
+    [lr]. *)
 let adam_step params (a : adam) =
   (* One tick per optimizer step, shared by every parameter. *)
   a.t <- a.t + 1;

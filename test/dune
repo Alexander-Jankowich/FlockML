@@ -1,6 +1,6 @@
-; One executable per phase so you can run just the part you're working on:
+; One executable per subsystem, so each can be run on its own:
 ;   dune exec test/test_tensor.exe
-; `dune test` runs them all. Every suite fails until its TODOs are done.
+; `dune test` runs them all.
 
 (tests
  (names test_tensor test_autograd test_nn test_optim test_conv)

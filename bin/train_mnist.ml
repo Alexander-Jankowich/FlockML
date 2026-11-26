@@ -1,4 +1,4 @@
-(* Train an MLP or CNN on MNIST / Fashion-MNIST.
+(** Train an MLP or CNN on MNIST / Fashion-MNIST.
 
      ./scripts/download_mnist.sh                       # once
      dune exec --profile release bin/train_mnist.exe -- --epochs 3
@@ -40,6 +40,8 @@ let spec =
     ("--log-every", Arg.Set_int log_every, " Print the loss every N batches");
   ]
 
+(** The architecture named by [--model]: a 784-128-10 MLP, or a two-block
+    conv/pool CNN followed by a linear classifier. *)
 let build_model rng = function
   | "mlp" ->
       Layer.sequential
@@ -66,6 +68,8 @@ let build_model rng = function
         ]
   | other -> failwith ("unknown model " ^ other)
 
+(** Test accuracy and confusion matrix, predicting in batches of 256 with
+    dropout off. *)
 let evaluate model (test : Dataset.t) =
   let preds =
     Dataset.batches ~batch_size:256 test

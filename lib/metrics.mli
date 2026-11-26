@@ -14,3 +14,5 @@ val confusion_matrix :
 (** [m.(true_label).(predicted)] counts. *)
 
 val pp_confusion_matrix : Format.formatter -> int array array -> unit
+(** Print a confusion matrix as an aligned table, true classes down the side
+    and predicted classes across the top. *)

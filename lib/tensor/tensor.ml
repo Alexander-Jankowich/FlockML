@@ -1,24 +1,28 @@
-(* Default backend: a contiguous row-major float array plus a shape.
+(** Default backend: a contiguous row-major float array plus a shape.
 
-   The element at multi-index [| i0; i1; ...; ik |] lives at
-   data.(i0 * strides.(0) + i1 * strides.(1) + ... + ik * strides.(k)).
+    The element at multi-index [[| i0; i1; ...; ik |]] lives at
+    [data.(i0 * strides.(0) + i1 * strides.(1) + ... + ik * strides.(k))].
 
-   Note: this file later defines [exp], [log], [sqrt] and [neg], which shadow
-   the Stdlib versions. Use [Float.exp], [Float.log], [Float.sqrt] etc. inside
-   helper code to avoid confusing type errors. *)
+    This file defines [exp], [log], [sqrt] and [neg], which shadow the Stdlib
+    versions, so helper code calls [Float.exp], [Float.log], [Float.sqrt] etc.
+    explicitly. *)
 
+(** A shape plus its elements in row-major order. *)
 type t = { shape : int array; data : float array }
 
 (* ------------------------------------------------------------------------ *)
-(* Construction and inspection (provided)                                    *)
+(* Construction and inspection                                               *)
 (* ------------------------------------------------------------------------ *)
 
+(** Number of elements a tensor of this shape holds. *)
 let numel_of_shape shape = Array.fold_left ( * ) 1 shape
 
+(** Render a shape as ["[2; 3]"], for error messages. *)
 let shape_to_string shape =
   "[" ^ String.concat "; " (Array.to_list (Array.map string_of_int shape)) ^ "]"
 
-(* strides [|2; 3; 4|] = [|12; 4; 1|] *)
+(** How far apart consecutive indices of each axis are in [data]:
+    [strides [|2; 3; 4|] = [|12; 4; 1|]]. *)
 let strides shape =
   let n = Array.length shape in
   let s = Array.make n 1 in
@@ -101,7 +105,7 @@ let pp fmt t =
 (* Indexing                                                                  *)
 (* ------------------------------------------------------------------------ *)
 
-(* Multi-index -> offset into [data]. *)
+(** The offset into [data] of a multi-index, with rank and bounds checks. *)
 let flat_index t idx =
   if Array.length idx <> ndim t then
     invalid_arg
@@ -127,12 +131,12 @@ let set t idx v = t.data.(flat_index t idx) <- v
 (* Random initialisation                                                      *)
 (* ------------------------------------------------------------------------ *)
 
-(* Unwrap the optional generator, or make a fresh self-seeded one. *)
+(** Unwrap the optional generator, or make a fresh self-seeded one. *)
 let get_rng = function
   | Some rng -> rng
   | None -> Random.State.make_self_init ()
 
-(* Samples from U(lo, hi): one draw per element. *)
+(** Samples from U(lo, hi): one draw per element. *)
 let rand_uniform ?rng ~lo ~hi shape =
   let rng = get_rng rng in
   let data =
@@ -141,8 +145,8 @@ let rand_uniform ?rng ~lo ~hi shape =
   in
   { shape = Array.copy shape; data }
 
-(* Samples from N(mean, std^2) via Box-Muller: every pair of uniforms gives
-   two independent standard normals. *)
+(** Samples from N(mean, std²) via Box-Muller: every pair of uniforms gives
+    two independent standard normals. *)
 let randn ?rng ?(mean = 0.0) ?(std = 1.0) shape =
   let rng = get_rng rng in
   let n = numel_of_shape shape in
@@ -166,9 +170,10 @@ let randn ?rng ?(mean = 0.0) ?(std = 1.0) shape =
 (* Broadcasting                                                               *)
 (* ------------------------------------------------------------------------ *)
 
-(* NumPy rule: right-align the shapes; on each axis the sizes must be equal or
-   one of them must be 1, and the result takes the larger. Walking both shapes
-   from the last axis and prepending to [acc] builds the result in order. *)
+(** NumPy rule: right-align the shapes; on each axis the sizes must be equal
+    or one of them must be 1, and the result takes the larger. Walking both
+    shapes from the last axis and prepending to [acc] builds the result in
+    order. *)
 let broadcast_shapes a b =
   let rec aux acc l1 l2 =
     match (l1, l2) with
@@ -187,17 +192,18 @@ let broadcast_shapes a b =
   let rev_list s = List.rev (Array.to_list s) in
   Array.of_list (aux [] (rev_list a) (rev_list b))
 
-(* The core broadcasting trick, shared by broadcast_to, sum_to_shape and map2.
+(** The core broadcasting trick, shared by [broadcast_to], [sum_to_shape] and
+    [map2].
 
-   [source_offset ~src ~big] returns a function that maps a flat index into a
-   tensor of the big (broadcast) shape to the offset of the element it comes
-   from in a tensor of the small shape [src].
+    [source_offset ~src ~big] returns a function that maps a flat index into a
+    tensor of the big (broadcast) shape to the offset of the element it comes
+    from in a tensor of the small shape [src].
 
-   It peels the multi-index off [flat] one axis at a time, from the last axis
-   to the first (this is "unravel", done without allocating an array). For each
-   axis, the matching source axis is [ax - k], where k = number of leading axes
-   that [src] lacks. Source axes of size 1 always use index 0, so they
-   contribute nothing to the offset. *)
+    It peels the multi-index off [flat] one axis at a time, from the last axis
+    to the first ("unravel", done without allocating an array). For each axis,
+    the matching source axis is [ax - k], where [k] is the number of leading
+    axes that [src] lacks. Source axes of size 1 always use index 0, so they
+    contribute nothing to the offset. *)
 let source_offset ~src ~big =
   let st = strides src in
   let k = Array.length big - Array.length src in
@@ -211,13 +217,15 @@ let source_offset ~src ~big =
     done;
     !offset
 
+(** Raise [Invalid_argument] (naming function [fn]) unless [small] broadcasts
+    to exactly [big]. *)
 let check_broadcastable ~fn ~small ~big =
   if broadcast_shapes small big <> big then
     invalid_arg
       (Printf.sprintf "Tensor.%s: %s does not broadcast to %s" fn
          (shape_to_string small) (shape_to_string big))
 
-(* Every output element reads the source element it maps to. *)
+(** Every output element reads the source element it maps to. *)
 let broadcast_to t target =
   check_broadcastable ~fn:"broadcast_to" ~small:t.shape ~big:target;
   let src = source_offset ~src:t.shape ~big:target in
@@ -226,8 +234,8 @@ let broadcast_to t target =
     data = Array.init (numel_of_shape target) (fun i -> t.data.(src i));
   }
 
-(* The adjoint of broadcast_to: same mapping, but every big element is ADDED
-   into the small element it maps to. *)
+(** The adjoint of [broadcast_to]: same mapping, but every big element is
+    added into the small element it maps to. *)
 let sum_to_shape t target =
   check_broadcastable ~fn:"sum_to_shape" ~small:target ~big:t.shape;
   let dst = source_offset ~src:target ~big:t.shape in
@@ -245,6 +253,8 @@ let sum_to_shape t target =
 
 let map f t = { shape = Array.copy t.shape; data = Array.map f t.data }
 
+(** Equal shapes take a direct loop; otherwise both operands are read through
+    [source_offset] into the broadcast shape. *)
 let map2 f a b =
   if a.shape = b.shape then
     (* fast path: no broadcasting needed *)
@@ -261,7 +271,7 @@ let map2 f a b =
     }
   end
 
-(* Derived ops: once [map] and [map2] work, these work too. *)
+(* Arithmetic, all derived from [map] and [map2]. *)
 let add a b = map2 ( +. ) a b
 let sub a b = map2 ( -. ) a b
 let mul a b = map2 ( *. ) a b
@@ -281,7 +291,8 @@ let sqrt t = map Float.sqrt t
 let sum t = scalar (Array.fold_left ( +. ) 0.0 t.data)
 let mean t = scale (1.0 /. float_of_int (numel t)) (sum t)
 
-(* Turn a possibly negative axis (-1 = last) into a valid non-negative one. *)
+(** Turn a possibly negative axis ([-1] = last) into a valid non-negative one,
+    raising [Invalid_argument] (naming function [fn]) if it is out of range. *)
 let normalize_axis ~fn t axis =
   let nd = ndim t in
   let a = if axis < 0 then axis + nd else axis in
@@ -291,8 +302,8 @@ let normalize_axis ~fn t axis =
          (shape_to_string t.shape));
   a
 
-(* View the shape as (outer, n, inner) around [axis]. Element (o, k, i) is at
-   data.(o * n * inner + k * inner + i). *)
+(** View the shape as [(outer, n, inner)] around [axis]. Element [(o, k, i)]
+    is at [data.(o * n * inner + k * inner + i)]. *)
 let split_around t axis =
   let outer = numel_of_shape (Array.sub t.shape 0 axis) in
   let n = t.shape.(axis) in
@@ -301,12 +312,15 @@ let split_around t axis =
   in
   (outer, n, inner)
 
-(* Shape after reducing [axis]: removed, or kept with size 1 if keepdims. *)
+(** Shape after reducing [axis]: removed, or kept with size 1 if [keepdims]. *)
 let reduced_shape ~keepdims t axis =
   if keepdims then Array.mapi (fun i d -> if i = axis then 1 else d) t.shape
   else
     Array.of_list (List.filteri (fun i _ -> i <> axis) (Array.to_list t.shape))
 
+(** Fold along [axis]: every output element starts at [init] and is updated
+    with [f acc value k] for each position [k] along the axis. [sum_axis] and
+    [max_axis] are both instances. *)
 let reduce_axis ~keepdims ~init ~f t axis =
   let axis = normalize_axis ~fn:"reduce_axis" t axis in
   let outer, n, inner = split_around t axis in
@@ -345,8 +359,8 @@ let argmax_axis t axis =
 (* Linear algebra and shape manipulation                                      *)
 (* ------------------------------------------------------------------------ *)
 
-(* i-p-j loop order: the innermost loop walks a row of [b] and a row of [c]
-   contiguously, which is far more cache friendly than the textbook i-j-p. *)
+(** i-p-j loop order: the innermost loop walks a row of [b] and a row of [c]
+    contiguously, which is far more cache friendly than the textbook i-j-p. *)
 let matmul a b =
   if ndim a <> 2 || ndim b <> 2 || a.shape.(1) <> b.shape.(0) then
     invalid_arg
@@ -379,7 +393,7 @@ let transpose t =
   done;
   { shape = [| n; m |]; data = out }
 
-(* Supports one -1 entry, whose size is inferred from the element count. *)
+(** Supports one [-1] entry, whose size is inferred from the element count. *)
 let reshape t new_shape =
   let fail () =
     invalid_arg
@@ -438,18 +452,20 @@ let one_hot ~num_classes labels =
 (* In-place operations                                                        *)
 (* ------------------------------------------------------------------------ *)
 
+(** Raise [Invalid_argument] (naming function [fn]) unless [a] and [b] have
+    exactly the same shape. In-place ops never broadcast. *)
 let check_same_shape ~fn a b =
   if a.shape <> b.shape then
     invalid_arg
       (Printf.sprintf "Tensor.%s: shape mismatch %s vs %s" fn
          (shape_to_string a.shape) (shape_to_string b.shape))
 
-(* y <- y + x *)
+(** [y <- y + x] *)
 let add_ y x =
   check_same_shape ~fn:"add_" y x;
   Array.iteri (fun i v -> y.data.(i) <- y.data.(i) +. v) x.data
 
-(* y <- y + alpha * x *)
+(** [y <- y + alpha * x] *)
 let axpy_ ~alpha ~x ~y =
   check_same_shape ~fn:"axpy_" y x;
   Array.iteri (fun i v -> y.data.(i) <- y.data.(i) +. (alpha *. v)) x.data
@@ -462,15 +478,17 @@ let blit_ ~src ~dst =
   Array.blit src.data 0 dst.data 0 (numel src)
 
 (* ------------------------------------------------------------------------ *)
-(* Convolution helpers (stretch goal, Phase 6)                                *)
+(* Convolution helpers                                                        *)
 (* ------------------------------------------------------------------------ *)
 
+(** How many positions a window of size [kernel] takes along an axis of
+    length [size], padded by [padding] on each side and moved by [stride]. *)
 let output_size ~size ~kernel ~stride ~padding =
   ((size + (2 * padding) - kernel) / stride) + 1
 
-(* The index walk shared by im2col and col2im. For every (output row, column)
-   pair that reads a real (non-padding) input element, call
-   [f col_offset input_offset]. Returns the column-matrix shape. *)
+(** The index walk shared by [im2col] and [col2im]. For every (output row,
+    column) pair that reads a real (non-padding) input element, call
+    [f col_offset input_offset]. Returns the column-matrix shape. *)
 let im2col_walk input_shape ~kh ~kw ~stride ~padding f =
   if Array.length input_shape <> 4 then
     invalid_arg "Tensor.im2col: expected an NHWC tensor [n; h; w; c]";
@@ -502,7 +520,7 @@ let im2col_walk input_shape ~kh ~kw ~stride ~padding f =
   done;
   [| n * oh * ow; cols |]
 
-(* Padding positions are never visited, so they stay 0. *)
+(** Padding positions are never visited, so they stay 0. *)
 let im2col t ~kh ~kw ~stride ~padding =
   let shape = im2col_walk t.shape ~kh ~kw ~stride ~padding (fun _ _ -> ()) in
   let out = Array.make (numel_of_shape shape) 0.0 in
@@ -511,7 +529,8 @@ let im2col t ~kh ~kw ~stride ~padding =
          out.(col) <- t.data.(pos)));
   { shape; data = out }
 
-(* Same walk, with the data flowing the other way and accumulating. *)
+(** Same walk as [im2col], with the data flowing the other way and
+    accumulating. *)
 let col2im t ~input_shape ~kh ~kw ~stride ~padding =
   let out = Array.make (numel_of_shape input_shape) 0.0 in
   let shape =
@@ -557,7 +576,7 @@ let max_pool2d t ~size ~stride =
   done;
   ({ shape = [| n; oh; ow; c |]; data = out }, argmax)
 
-(* Only the winning input of each window gets gradient. *)
+(** Only the winning input of each window gets gradient. *)
 let max_pool2d_backward ~grad_out ~argmax ~input_shape =
   let out = Array.make (numel_of_shape input_shape) 0.0 in
   Array.iteri (fun o i -> out.(i) <- out.(i) +. grad_out.data.(o)) argmax;

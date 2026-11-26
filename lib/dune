@@ -2,9 +2,4 @@
 
 (library
  (name flockml)
- (public_name flockml)
- ; While TODO stubs exist, many parameters/values are unused, which the dev
- ; profile would turn into errors. Delete this `flags` line once every TODO is
- ; done so the compiler starts catching real unused-variable mistakes again.
- (flags
-  (:standard -w -26-27-32-33-35-37-39-69)))
+ (public_name flockml))

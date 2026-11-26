@@ -1,10 +1,12 @@
-(* Matmul throughput, to compare loop orders and against NumPy
+(** Matmul throughput, to compare loop orders and against NumPy
    (bench/numpy_baseline.py). Always run in release mode:
 
      dune exec --profile release bench/bench_matmul.exe *)
 
 open Flockml
 
+(** Average seconds per call of [f] over [repeats] calls, after one warm-up
+    call. *)
 let time_it ~repeats f =
   f ();
   (* warm-up *)
