@@ -1,0 +1,3 @@
+(executables
+ (names xor train_mnist)
+ (libraries flockml))

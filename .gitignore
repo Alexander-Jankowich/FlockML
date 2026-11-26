@@ -1,0 +1,10 @@
+_build/
+_opam/
+*.install
+.merlin
+
+# datasets and generated artifacts
+data/
+*.dot
+*.svg
+*.png

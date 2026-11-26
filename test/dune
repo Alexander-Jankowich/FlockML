@@ -1,0 +1,7 @@
+; One executable per phase so you can run just the part you're working on:
+;   dune exec test/test_tensor.exe
+; `dune test` runs them all. Every suite fails until its TODOs are done.
+
+(tests
+ (names test_tensor test_autograd test_nn test_optim test_conv)
+ (libraries flockml ounit2))
