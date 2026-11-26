@@ -79,7 +79,33 @@ let set_lr opt lr =
      else:                 v <- momentum * v + g       (Tensor.scale_, add_)
                            p <- p - lr * v
    Check with the hand-computed numbers in test/test_optim.ml. *)
-let sgd_step params (s : sgd) = Todo.todo "Optim.sgd_step"
+let sgd_step params (s : sgd) =
+  Array.iteri
+    (fun i param ->
+      match Var.grad param with
+      | None -> () (* not used in this loss: leave it alone *)
+      | Some g ->
+          (* [p] is the parameter's actual storage, so mutating it updates
+             the model; no new Var is created. *)
+          let p = Var.value param in
+          (* Weight decay = gradient of (wd/2)·||p||². Build a NEW tensor
+             rather than mutating [g], which is still the param's grad. *)
+          let g =
+            if s.weight_decay > 0. then
+              Tensor.add g (Tensor.scale s.weight_decay p)
+            else g
+          in
+          if s.momentum = 0. then
+            (* p <- p - lr * g *)
+            Tensor.axpy_ ~alpha:(-.s.lr) ~x:g ~y:p
+          else begin
+            (* v <- momentum * v + g;  p <- p - lr * v *)
+            let v = s.velocity.(i) in
+            Tensor.scale_ s.momentum v;
+            Tensor.add_ v g;
+            Tensor.axpy_ ~alpha:(-.s.lr) ~x:v ~y:p
+          end)
+    params
 
 (* TODO [Phase 4, medium]: Adam.
      t <- t + 1                                  (once per step, not per param)
@@ -93,7 +119,42 @@ let sgd_step params (s : sgd) = Todo.todo "Optim.sgd_step"
    Store m, v back with Tensor.blit_ (or update them in place directly).
    Nice property for testing: on step 1, m_hat / sqrt v_hat = sign(g), so
    every parameter moves by almost exactly lr. *)
-let adam_step params (a : adam) = Todo.todo "Optim.adam_step"
+let adam_step params (a : adam) =
+  (* One tick per optimizer step, shared by every parameter. *)
+  a.t <- a.t + 1;
+  (* Bias corrections. m and v start at 0, so early on they underestimate
+     the true averages; dividing by (1 - beta^t) undoes that. Both are the
+     same for every parameter, so compute them once. *)
+  let t = float_of_int a.t in
+  let bc1 = 1. -. Float.pow a.beta1 t and bc2 = 1. -. Float.pow a.beta2 t in
+  Array.iteri
+    (fun i param ->
+      match Var.grad param with
+      | None -> ()
+      | Some g ->
+          let p = Var.value param in
+          (* Weight decay = gradient of (wd/2)·||p||². Build a NEW tensor
+             rather than mutating [g], which is still the param's grad. *)
+          let g =
+            if a.weight_decay > 0. then
+              Tensor.add g (Tensor.scale a.weight_decay p)
+            else g
+          in
+          let m = a.m.(i) and v = a.v.(i) in
+          (* m <- beta1 * m + (1 - beta1) * g      (running mean of g) *)
+          Tensor.scale_ a.beta1 m;
+          Tensor.axpy_ ~alpha:(1. -. a.beta1) ~x:g ~y:m;
+          (* v <- beta2 * v + (1 - beta2) * g^2    (running mean of g^2) *)
+          Tensor.scale_ a.beta2 v;
+          Tensor.axpy_ ~alpha:(1. -. a.beta2) ~x:(Tensor.mul g g) ~y:v;
+          (* p <- p - lr * m_hat / (sqrt v_hat + eps), elementwise *)
+          let update =
+            Tensor.map2
+              (fun mi vi -> mi /. bc1 /. (Float.sqrt (vi /. bc2) +. a.eps))
+              m v
+          in
+          Tensor.axpy_ ~alpha:(-.a.lr) ~x:update ~y:p)
+    params
 
 let step opt =
   match opt.kind with

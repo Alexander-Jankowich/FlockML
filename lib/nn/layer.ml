@@ -71,11 +71,58 @@ let sequential layers = Sequential layers
        then Var.reshape out [| n; oh; ow; out_c |]
        with oh = (h + 2*padding - kernel) / stride + 1 (same for ow).
    - Max_pool2d [Phase 6]: Var.max_pool2d x ~size ~stride. *)
-let rec forward ?(train = false) ?rng layer x = Todo.todo "Layer.forward"
+let rec forward ?(train = false) ?rng layer x =
+  match layer with
+  | Linear r -> Var.add (Var.matmul x r.w) r.b
+  | Conv2d r ->
+      (* x : [n; h; w; in_c]   r.w : [kernel*kernel*in_c; out_c]   r.b : [out_c] *)
+      let s = Var.shape x in
+      let n = s.(0) and h = s.(1) and wd = s.(2) in
+      let oh = ((h + (2 * r.padding) - r.kernel) / r.stride) + 1
+      and ow = ((wd + (2 * r.padding) - r.kernel) / r.stride) + 1
+      and out_c = (Var.shape r.w).(1) in
+      (* One row per output pixel, holding its receptive field:
+       [n*oh*ow; kernel*kernel*in_c] *)
+      let cols =
+        Var.im2col x ~kh:r.kernel ~kw:r.kernel ~stride:r.stride
+          ~padding:r.padding
+      in
+      (* Every filter applied to every patch at once: [n*oh*ow; out_c] *)
+      let out = Var.add (Var.matmul cols r.w) r.b in
+      Var.reshape out [| n; oh; ow; out_c |]
+  | Max_pool2d r -> Var.max_pool2d x ~size:r.size ~stride:r.stride
+  | Relu -> Var.relu x
+  | Sigmoid -> Var.sigmoid x
+  | Tanh -> Var.tanh x
+  | Flatten ->
+      (* [n; d1; d2; ...] -> [n; d1*d2*...]: keep the batch axis, merge the rest *)
+      let s = Var.shape x in
+      let n = s.(0) in
+      let numel = Array.fold_left ( * ) 1 s in
+      Var.reshape x [| n; numel / n |]
+  | Dropout p ->
+      if not train then x
+      else
+        (* Inverted dropout: keep each unit with probability 1 - p and scale
+           the survivors by 1/(1-p), so the expected value is unchanged and
+           eval mode needs no rescaling. *)
+        let keep = 1. /. (1. -. p) in
+        let mask =
+          Tensor.rand_uniform ?rng ~lo:0. ~hi:1. (Var.shape x)
+          |> Tensor.map (fun u -> if u > p then keep else 0.)
+        in
+        Var.mul x (Var.const mask)
+  | Sequential layers ->
+      (* Feed each layer's output into the next, threading train/rng down. *)
+      List.fold_left (fun acc layer -> forward ~train ?rng layer acc) x layers
 
 (* TODO [Phase 3, easy]: collect [w; b] from Linear and Conv2d, recurse into
    Sequential (List.concat_map), and [] for everything else. *)
-let rec params layer = Todo.todo "Layer.params"
+let rec params = function
+  | Linear r -> [ r.w; r.b ]
+  | Conv2d r -> [ r.w; r.b ]
+  | Sequential layers -> List.concat_map params layers
+  | _ -> []
 
 (* ------------------------------------------------------------------------ *)
 (* Utilities (provided)                                                      *)
