@@ -1352,6 +1352,88 @@ let sgd_update_ ~lr ~momentum ~weight_decay ~param ~grad ~velocity =
         end
       done)
 
+(** As {!adam_update_}, but the decay scales the parameter before the step
+    instead of adding to the gradient. *)
+let adamw_update_ ~lr ~beta1 ~beta2 ~eps ~weight_decay ~bc1 ~bc2 ~param ~grad
+    ~m ~v =
+  check_all_same ~fn:"adamw_update_" param [ grad; m; v ];
+  let p = param.data and g = grad.data and md = m.data and vd = v.data in
+  let c1 = 1. -. beta1 and c2 = 1. -. beta2 and neg_lr = -.lr in
+  let keep = 1. -. (lr *. weight_decay) in
+  Parallel.parallel_for ~work:6 (Array.length p) (fun lo hi ->
+      for i = lo to hi - 1 do
+        let pi = keep *. uget p i in
+        let gi = uget g i in
+        let mi = (beta1 *. uget md i) +. (c1 *. gi) in
+        let vi = (beta2 *. uget vd i) +. (c2 *. (gi *. gi)) in
+        uset md i mi;
+        uset vd i vi;
+        let u = mi /. bc1 /. (Float.sqrt (vi /. bc2) +. eps) in
+        uset p i (pi +. (neg_lr *. u))
+      done)
+
+let sgd_nesterov_update_ ~lr ~momentum ~weight_decay ~param ~grad ~velocity =
+  check_all_same ~fn:"sgd_nesterov_update_" param [ grad; velocity ];
+  let p = param.data and g = grad.data and vd = velocity.data in
+  let neg_lr = -.lr and decay = weight_decay > 0. in
+  Parallel.parallel_for ~work:2 (Array.length p) (fun lo hi ->
+      for i = lo to hi - 1 do
+        let pi = uget p i in
+        let gi = uget g i in
+        let gi = if decay then gi +. (weight_decay *. pi) else gi in
+        let vi = (momentum *. uget vd i) +. gi in
+        uset vd i vi;
+        uset p i (pi +. (neg_lr *. (gi +. (momentum *. vi))))
+      done)
+
+(** The operations in the order of PyTorch's [RMSprop], so the results agree
+    to rounding. *)
+let rmsprop_update_ ~lr ~alpha ~eps ~weight_decay ~momentum ~centered ~param
+    ~grad ~square_avg ~grad_avg ~momentum_buf =
+  check_all_same ~fn:"rmsprop_update_" param [ grad; square_avg ];
+  if centered then check_same_shape ~fn:"rmsprop_update_" param grad_avg;
+  if momentum > 0. then check_same_shape ~fn:"rmsprop_update_" param momentum_buf;
+  let p = param.data and g = grad.data and sq = square_avg.data in
+  let ga = grad_avg.data and buf = momentum_buf.data in
+  let c = 1. -. alpha and neg_lr = -.lr and decay = weight_decay > 0. in
+  Parallel.parallel_for ~work:6 (Array.length p) (fun lo hi ->
+      for i = lo to hi - 1 do
+        let pi = uget p i in
+        let gi = uget g i in
+        let gi = if decay then gi +. (weight_decay *. pi) else gi in
+        let si = (alpha *. uget sq i) +. (c *. (gi *. gi)) in
+        uset sq i si;
+        let denom =
+          if centered then begin
+            let ai = uget ga i in
+            let ai = ai +. (c *. (gi -. ai)) in
+            uset ga i ai;
+            Float.sqrt (si -. (ai *. ai)) +. eps
+          end
+          else Float.sqrt si +. eps
+        in
+        if momentum > 0. then begin
+          let bi = (momentum *. uget buf i) +. (gi /. denom) in
+          uset buf i bi;
+          uset p i (pi +. (neg_lr *. bi))
+        end
+        else uset p i (pi +. (neg_lr *. (gi /. denom)))
+      done)
+
+let adagrad_update_ ~lr ~eps ~weight_decay ~param ~grad ~sum =
+  check_all_same ~fn:"adagrad_update_" param [ grad; sum ];
+  let p = param.data and g = grad.data and sd = sum.data in
+  let neg_lr = -.lr and decay = weight_decay > 0. in
+  Parallel.parallel_for ~work:4 (Array.length p) (fun lo hi ->
+      for i = lo to hi - 1 do
+        let pi = uget p i in
+        let gi = uget g i in
+        let gi = if decay then gi +. (weight_decay *. pi) else gi in
+        let si = uget sd i +. (gi *. gi) in
+        uset sd i si;
+        uset p i (pi +. (neg_lr *. (gi /. (Float.sqrt si +. eps))))
+      done)
+
 (* ------------------------------------------------------------------------ *)
 (* Convolution helpers                                                        *)
 (* ------------------------------------------------------------------------ *)

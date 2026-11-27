@@ -276,6 +276,31 @@ module type S = sig
             ~backward:(fun g -> [ Some (mul g (add cdf (mul v pdf))) ])
       ]} *)
 
+  (** {1 Activations}
+
+      Built from the operations above, or as one {!custom} node with a
+      closed-form derivative. *)
+
+  val leaky_relu : ?slope:float -> t -> t
+  (** [x] where [x > 0], [slope * x] elsewhere (default [slope = 0.01]). *)
+
+  val elu : ?alpha:float -> t -> t
+  (** [x] where [x > 0], [alpha * (e^x - 1)] elsewhere (default
+      [alpha = 1]). *)
+
+  val gelu : ?approximate:bool -> t -> t
+  (** [x * Φ(x)], with [Φ] the standard normal CDF, computed with {!erf}.
+      With [~approximate:true], PyTorch's ["tanh"] approximation
+      [0.5 x (1 + tanh (sqrt (2/π) (x + 0.044715 x³)))]. *)
+
+  val silu : t -> t
+  (** [x * sigmoid x] (also called swish). *)
+
+  val softplus : ?beta:float -> ?threshold:float -> t -> t
+  (** [log (1 + e^(beta x)) / beta], computed stably, and [x] where
+      [beta x > threshold] (defaults: [beta = 1], [threshold = 20]), as in
+      PyTorch. *)
+
   (** {1 Gradient utilities} *)
 
   val set_requires_grad : t -> bool -> unit

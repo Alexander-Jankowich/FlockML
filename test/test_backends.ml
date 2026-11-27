@@ -32,8 +32,20 @@ let suites_f64 =
   let module C = Flockml_tests.Conv_tests.Make (F64) in
   let module K = Flockml_tests.Kernel_tests.Make (F64) in
   let module P = Flockml_tests.Numpy_tests.Make (F64) in
+  let module Th = Flockml_tests.Torch_tests.Make (F64) in
+  let module L = Flockml_tests.Layers_tests.Make (F64) in
   "suites on Tensor_blas.F64"
-  >::: [ T.suite; A.suite; N.suite; O.suite; C.suite; K.suite; P.suite ]
+  >::: [
+         T.suite;
+         A.suite;
+         N.suite;
+         O.suite;
+         C.suite;
+         K.suite;
+         P.suite;
+         Th.suite;
+         L.suite;
+       ]
 
 (** How close a backend must be to the default one. *)
 module type TOLERANCE = sig
@@ -289,6 +301,53 @@ module Agree (B : Flockml.S) (Tol : TOLERANCE) = struct
             ~param:bp ~grad:(into g) ~velocity:bvel;
           close ~msg p' bp;
           close ~msg vel bvel);
+      case "adamw_update_" (fun ~msg ->
+          let p' = Tensor.copy p
+          and m' = Tensor.copy m
+          and v' = Tensor.copy v in
+          let bp = into p and bm = into m and bv = into v in
+          Tensor.adamw_update_ ~lr:0.01 ~beta1:0.9 ~beta2:0.999 ~eps:1e-8
+            ~weight_decay:0.1 ~bc1:0.271 ~bc2:0.003 ~param:p' ~grad:g ~m:m'
+            ~v:v';
+          B.Tensor.adamw_update_ ~lr:0.01 ~beta1:0.9 ~beta2:0.999 ~eps:1e-8
+            ~weight_decay:0.1 ~bc1:0.271 ~bc2:0.003 ~param:bp ~grad:(into g)
+            ~m:bm ~v:bv;
+          close ~msg p' bp;
+          close ~msg m' bm;
+          close ~msg v' bv);
+      case "sgd_nesterov_update_" (fun ~msg ->
+          let p' = Tensor.copy p and vel = Tensor.copy v in
+          let bp = into p and bvel = into v in
+          Tensor.sgd_nesterov_update_ ~lr:0.1 ~momentum:0.9 ~weight_decay:0.01
+            ~param:p' ~grad:g ~velocity:vel;
+          B.Tensor.sgd_nesterov_update_ ~lr:0.1 ~momentum:0.9 ~weight_decay:0.01
+            ~param:bp ~grad:(into g) ~velocity:bvel;
+          close ~msg p' bp;
+          close ~msg vel bvel);
+      case "rmsprop_update_" (fun ~msg ->
+          List.iter
+            (fun (momentum, centered) ->
+              let p' = Tensor.copy p and sq = Tensor.add_scalar 2. v in
+              let ga = Tensor.copy m and buf = Tensor.copy g in
+              let bp = into p and bsq = into sq and bga = into ga in
+              let bbuf = into buf in
+              Tensor.rmsprop_update_ ~lr:0.01 ~alpha:0.9 ~eps:1e-8
+                ~weight_decay:0.01 ~momentum ~centered ~param:p' ~grad:g
+                ~square_avg:sq ~grad_avg:ga ~momentum_buf:buf;
+              B.Tensor.rmsprop_update_ ~lr:0.01 ~alpha:0.9 ~eps:1e-8
+                ~weight_decay:0.01 ~momentum ~centered ~param:bp ~grad:(into g)
+                ~square_avg:bsq ~grad_avg:bga ~momentum_buf:bbuf;
+              List.iter2 (close ~msg) [ p'; sq; ga; buf ] [ bp; bsq; bga; bbuf ])
+            [ (0., false); (0.5, true) ]);
+      case "adagrad_update_" (fun ~msg ->
+          let p' = Tensor.copy p and sum = Tensor.copy v in
+          let bp = into p and bsum = into v in
+          Tensor.adagrad_update_ ~lr:0.1 ~eps:1e-10 ~weight_decay:0.01 ~param:p'
+            ~grad:g ~sum;
+          B.Tensor.adagrad_update_ ~lr:0.1 ~eps:1e-10 ~weight_decay:0.01
+            ~param:bp ~grad:(into g) ~sum:bsum;
+          close ~msg p' bp;
+          close ~msg sum bsum);
     ]
 
   let convolution =
@@ -376,9 +435,7 @@ module Agree (B : Flockml.S) (Tol : TOLERANCE) = struct
             let x = S.Tensor.randn ~rng:(Random.State.make [| step |]) shape in
             S.Optim.zero_grad opt;
             let logits = S.Layer.forward ~train:true model (S.Var.const x) in
-            let loss =
-              S.Loss.cross_entropy ~logits ~labels:[| 0; 1; 2; 3; 4; 0 |]
-            in
+            let loss = S.Loss.cross_entropy logits [| 0; 1; 2; 3; 4; 0 |] in
             S.Var.backward loss;
             S.Optim.step opt;
             S.Tensor.item (S.Var.value loss))
@@ -409,6 +466,91 @@ module Agree (B : Flockml.S) (Tol : TOLERANCE) = struct
               (fun p bp -> close ~msg ~scale:100. p (into bp))
               params bparams))
       [ `Cnn; `Mlp ]
+
+  (** A few steps of two models made of the Phase 9 layers, from the same seed
+      on both backends (as {!training}): a CNN with dilated and grouped
+      convolutions, batch norm and average pooling, trained with Nesterov SGD,
+      and a causal-attention / layer-norm / GELU / GRU stack trained with AdamW
+      and label smoothing. *)
+  let layers_training =
+    let train (type v t)
+        (module S : Flockml.S with type Var.t = v and type Tensor.t = t) kind =
+      let rng = Random.State.make [| 11 |] in
+      let model, opt, shape, labels =
+        match kind with
+        | `Cnn ->
+            let m =
+              S.Layer.sequential
+                [
+                  S.Layer.conv2d ~rng ~padding:2 ~dilation:2 ~in_channels:2
+                    ~out_channels:4 ~kernel:3 ();
+                  S.Layer.batch_norm 4;
+                  S.Layer.relu;
+                  S.Layer.conv2d ~rng ~groups:2 ~stride:2 ~padding:1
+                    ~in_channels:4 ~out_channels:4 ~kernel:3 ();
+                  S.Layer.avg_pool2d 2;
+                  S.Layer.flatten;
+                  S.Layer.linear ~rng ~in_dim:16 ~out_dim:5 ();
+                ]
+            in
+            ( m,
+              S.Optim.sgd ~lr:0.05 ~momentum:0.9 ~nesterov:true
+                (S.Layer.params m),
+              [| 6; 8; 8; 2 |],
+              [| 0; 1; 2; 3; 4; 0 |] )
+        | `Seq ->
+            let m =
+              S.Layer.sequential
+                [
+                  S.Layer.residual
+                    (S.Layer.sequential
+                       [
+                         S.Layer.layer_norm [| 8 |];
+                         S.Layer.multi_head_attention ~rng ~causal:true ~dim:8
+                           ~heads:2 ();
+                       ]);
+                  S.Layer.gelu ();
+                  S.Layer.gru ~rng ~input:8 ~hidden:5 ();
+                ]
+            in
+            ( m,
+              S.Optim.adamw ~lr:1e-2 (S.Layer.params m),
+              [| 2; 5; 8 |],
+              Array.init 10 (fun i -> i mod 5) )
+      in
+      let losses =
+        List.init 3 (fun step ->
+            let x = S.Tensor.randn ~rng:(Random.State.make [| step |]) shape in
+            S.Optim.zero_grad opt;
+            let logits = S.Layer.forward ~train:true model (S.Var.const x) in
+            let loss =
+              S.Loss.cross_entropy ~label_smoothing:0.1 logits labels
+            in
+            S.Var.backward loss;
+            S.Optim.step opt;
+            S.Tensor.item (S.Var.value loss))
+      in
+      let state =
+        List.map
+          (fun (_, v) ->
+            Tensor.of_array (S.Tensor.shape v) (S.Tensor.to_array v))
+          (S.Layer.state_dict model)
+      in
+      (losses, state)
+    in
+    List.map
+      (fun (name, kind) ->
+        case name (fun ~msg ->
+            let losses, state = train (module Default) kind in
+            let blosses, bstate = train (module B) kind in
+            List.iter2
+              (fun l bl ->
+                close ~msg ~scale:10. (Tensor.scalar l) (B.Tensor.scalar bl))
+              losses blosses;
+            List.iter2
+              (fun p bp -> close ~msg ~scale:100. p (into bp))
+              state bstate))
+      [ ("CNN of the new layers", `Cnn); ("sequence model", `Seq) ]
 
   (** The NumPy-level API (Phase 7): every op from the same inputs. *)
   let numpy_api =
@@ -631,6 +773,7 @@ module Agree (B : Flockml.S) (Tol : TOLERANCE) = struct
            "in-place and optimizer kernels" >::: in_place;
            "convolution" >::: convolution;
            "training" >::: training;
+           "training with the Phase 9 layers" >::: layers_training;
          ]
 end
 

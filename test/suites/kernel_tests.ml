@@ -458,6 +458,93 @@ module Make (B : Flockml.S) = struct
           ~grad:g ~velocity:vel;
         assert_last_bits ~msg:"param" p' p;
         assert_last_bits ~msg:"velocity" vel' vel );
+      ( "adamw_update_ = decay, then unfused Adam" >:: fun _ ->
+        let p = rand_tensor shape and g = rand_tensor shape in
+        let m = rand_tensor shape and v = rand_tensor ~lo:0. ~hi:1. shape in
+        let lr = 0.01 and b1 = 0.9 and b2 = 0.999 and eps = 1e-8 and wd = 0.1 in
+        let bc1 = 1. -. (b1 ** 3.) and bc2 = 1. -. (b2 ** 3.) in
+        let p' = Tensor.scale (1. -. (lr *. wd)) p in
+        let m' = Tensor.copy m and v' = Tensor.copy v in
+        Tensor.scale_ b1 m';
+        Tensor.axpy_ ~alpha:(1. -. b1) ~x:g ~y:m';
+        Tensor.scale_ b2 v';
+        Tensor.axpy_ ~alpha:(1. -. b2) ~x:(Tensor.mul g g) ~y:v';
+        let u =
+          Tensor.map2
+            (fun mi vi -> mi /. bc1 /. (Float.sqrt (vi /. bc2) +. eps))
+            m' v'
+        in
+        Tensor.axpy_ ~alpha:(-.lr) ~x:u ~y:p';
+        Tensor.adamw_update_ ~lr ~beta1:b1 ~beta2:b2 ~eps ~weight_decay:wd ~bc1
+          ~bc2 ~param:p ~grad:g ~m ~v;
+        assert_last_bits ~msg:"param" p' p;
+        assert_last_bits ~msg:"m" m' m;
+        assert_last_bits ~msg:"v" v' v );
+      ( "sgd_nesterov_update_ = unfused Nesterov SGD" >:: fun _ ->
+        let p = rand_tensor shape
+        and g = rand_tensor shape
+        and vel = rand_tensor shape in
+        let p' = Tensor.copy p and vel' = Tensor.copy vel in
+        let g' = Tensor.add g (Tensor.scale 0.01 p') in
+        Tensor.scale_ 0.9 vel';
+        Tensor.add_ vel' g';
+        Tensor.axpy_ ~alpha:(-0.1)
+          ~x:(Tensor.add g' (Tensor.scale 0.9 vel'))
+          ~y:p';
+        Tensor.sgd_nesterov_update_ ~lr:0.1 ~momentum:0.9 ~weight_decay:0.01
+          ~param:p ~grad:g ~velocity:vel;
+        assert_last_bits ~msg:"param" p' p;
+        assert_last_bits ~msg:"velocity" vel' vel );
+      ( "rmsprop_update_ = unfused RMSprop" >:: fun _ ->
+        List.iter
+          (fun (momentum, centered) ->
+            let p = rand_tensor shape and g = rand_tensor shape in
+            let sq = rand_tensor ~lo:2. ~hi:3. shape
+            and ga = rand_tensor shape in
+            let buf = rand_tensor shape in
+            let alpha = 0.9 and lr = 0.01 and eps = 1e-8 and wd = 0.05 in
+            let g' = Tensor.add g (Tensor.scale wd p) in
+            let sq' =
+              Tensor.add (Tensor.scale alpha sq)
+                (Tensor.scale (1. -. alpha) (Tensor.mul g' g'))
+            in
+            let ga' =
+              Tensor.add ga (Tensor.scale (1. -. alpha) (Tensor.sub g' ga))
+            in
+            let denom =
+              Tensor.add_scalar eps
+                (Tensor.sqrt
+                   (if centered then Tensor.sub sq' (Tensor.mul ga' ga')
+                    else sq'))
+            in
+            let step = Tensor.div g' denom in
+            let buf' = Tensor.add (Tensor.scale momentum buf) step in
+            let p' =
+              Tensor.sub p
+                (Tensor.scale lr (if momentum > 0. then buf' else step))
+            in
+            Tensor.rmsprop_update_ ~lr ~alpha ~eps ~weight_decay:wd ~momentum
+              ~centered ~param:p ~grad:g ~square_avg:sq ~grad_avg:ga
+              ~momentum_buf:buf;
+            assert_last_bits ~msg:"param" p' p;
+            assert_last_bits ~msg:"square_avg" sq' sq;
+            if centered then assert_last_bits ~msg:"grad_avg" ga' ga;
+            if momentum > 0. then assert_last_bits ~msg:"buffer" buf' buf)
+          [ (0., false); (0.9, false); (0., true); (0.5, true) ] );
+      ( "adagrad_update_ = unfused Adagrad" >:: fun _ ->
+        let p = rand_tensor shape and g = rand_tensor shape in
+        let sum = rand_tensor ~lo:0. ~hi:1. shape in
+        let g' = Tensor.add g (Tensor.scale 0.1 p) in
+        let sum' = Tensor.add sum (Tensor.mul g' g') in
+        let p' =
+          Tensor.sub p
+            (Tensor.scale 0.05
+               (Tensor.div g' (Tensor.add_scalar 1e-10 (Tensor.sqrt sum'))))
+        in
+        Tensor.adagrad_update_ ~lr:0.05 ~eps:1e-10 ~weight_decay:0.1 ~param:p
+          ~grad:g ~sum;
+        assert_last_bits ~msg:"param" p' p;
+        assert_last_bits ~msg:"sum" sum' sum );
       ( "take_rows_ = take_rows" >:: fun _ ->
         let x = rand_tensor [| 10; 3; 2 |] and idx = [| 4; 0; 9 |] in
         let dst = Tensor.zeros [| 3; 3; 2 |] in
@@ -557,10 +644,66 @@ module Make (B : Flockml.S) = struct
       in
       Optim.zero_grad opt;
       let logits = Layer.forward ~train:true model (Var.const x) in
-      Var.backward (Loss.cross_entropy ~logits ~labels:[| 0; 1; 2; 3; 4; 0 |]);
+      Var.backward (Loss.cross_entropy logits [| 0; 1; 2; 3; 4; 0 |]);
       Optim.step opt
     done;
     List.map (fun p -> Tensor.copy (Var.value p)) (Layer.params model)
+
+  (** A few steps of two models made of the Phase 9 layers (dilated and grouped
+      convolutions, batch norm, average pooling, causal attention, layer norm,
+      GELU, an LSTM), with Nesterov SGD and AdamW: every parameter and buffer
+      afterwards. *)
+  let train_layers () =
+    let rng = Random.State.make [| 11 |] in
+    let cnn =
+      Layer.sequential
+        [
+          Layer.conv2d ~rng ~padding:2 ~dilation:2 ~in_channels:2
+            ~out_channels:4 ~kernel:3 ();
+          Layer.batch_norm 4;
+          Layer.relu;
+          Layer.conv2d ~rng ~groups:2 ~stride:2 ~padding:1 ~in_channels:4
+            ~out_channels:4 ~kernel:3 ();
+          Layer.avg_pool2d 2;
+          Layer.flatten;
+          Layer.linear ~rng ~in_dim:16 ~out_dim:5 ();
+        ]
+    and seq =
+      Layer.sequential
+        [
+          Layer.residual
+            (Layer.sequential
+               [
+                 Layer.layer_norm [| 8 |];
+                 Layer.multi_head_attention ~rng ~causal:true ~dim:8 ~heads:2 ();
+               ]);
+          Layer.gelu ();
+          Layer.lstm ~rng ~input:8 ~hidden:5 ();
+        ]
+    in
+    let o1 = Optim.sgd ~lr:0.05 ~momentum:0.9 ~nesterov:true (Layer.params cnn)
+    and o2 = Optim.adamw ~lr:1e-2 (Layer.params seq) in
+    for step = 1 to 3 do
+      let x = Tensor.randn ~rng:(Random.State.make [| step |]) [| 6; 8; 8; 2 |]
+      and s =
+        Tensor.randn ~rng:(Random.State.make [| 100 + step |]) [| 2; 5; 8 |]
+      in
+      Optim.zero_grad o1;
+      Optim.zero_grad o2;
+      Var.backward
+        (Loss.cross_entropy
+           (Layer.forward ~train:true cnn (Var.const x))
+           [| 0; 1; 2; 3; 4; 0 |]);
+      Var.backward
+        (Loss.cross_entropy ~label_smoothing:0.1
+           (Layer.forward ~train:true seq (Var.const s))
+           (Array.init 10 (fun i -> i mod 5)));
+      Optim.step o1;
+      Optim.step o2
+    done;
+    List.map
+      (fun (_, t) -> Tensor.copy t)
+      (Layer.state_dict cnn @ Layer.state_dict seq)
 
   let determinism_tests =
     let a = rand_tensor [| 130; 300 |] and b = rand_tensor [| 300; 70 |] in
@@ -569,6 +712,12 @@ module Make (B : Flockml.S) = struct
     let img = rand_tensor [| 6; 9; 9; 3 |] in
     let copy_input = rand_tensor [| 6; 70; 9 |] in
     let index_input = rand_tensor [| 40; 30; 5 |] in
+    let optim_inputs =
+      ( rand_tensor [| 300; 200 |],
+        rand_tensor [| 300; 200 |],
+        rand_tensor [| 300; 200 |],
+        rand_tensor ~lo:0. ~hi:1. [| 300; 200 |] )
+    in
     let bmm_inputs =
       ( rand_tensor [| 16; 9; 30 |],
         rand_tensor [| 16; 30; 7 |],
@@ -616,6 +765,27 @@ module Make (B : Flockml.S) = struct
             Tensor.bmm ~trans_a:true a2 b2;
             Tensor.matmul a3 b3;
           ]);
+      same_at_every_thread_count "optimizer kernels" (fun () ->
+          let p, g, m, v = optim_inputs in
+          let c = Tensor.copy in
+          let p1 = c p and m1 = c m and v1 = c v in
+          Tensor.adamw_update_ ~lr:0.01 ~beta1:0.9 ~beta2:0.999 ~eps:1e-8
+            ~weight_decay:0.1 ~bc1:0.1 ~bc2:0.01 ~param:p1 ~grad:g ~m:m1 ~v:v1;
+          let p2 = c p and m2 = c m in
+          Tensor.sgd_nesterov_update_ ~lr:0.1 ~momentum:0.9 ~weight_decay:0.01
+            ~param:p2 ~grad:g ~velocity:m2;
+          let p3 = c p
+          and s3 = Tensor.add_scalar 2. v
+          and a3 = c m
+          and b3 = c g in
+          Tensor.rmsprop_update_ ~lr:0.01 ~alpha:0.9 ~eps:1e-8
+            ~weight_decay:0.01 ~momentum:0.5 ~centered:true ~param:p3 ~grad:g
+            ~square_avg:s3 ~grad_avg:a3 ~momentum_buf:b3;
+          let p4 = c p and s4 = c v in
+          Tensor.adagrad_update_ ~lr:0.1 ~eps:1e-10 ~weight_decay:0.01 ~param:p4
+            ~grad:g ~sum:s4;
+          [ p1; m1; v1; p2; m2; p3; s3; a3; b3; p4; s4 ]);
+      same_at_every_thread_count "training with the Phase 9 layers" train_layers;
       same_at_every_thread_count "indexing and new reductions" (fun () ->
           let x = index_input in
           let idx = Array.init 50 (fun i -> i * 7 mod 30) in

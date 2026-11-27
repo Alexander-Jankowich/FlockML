@@ -632,6 +632,62 @@ struct
   let custom ~name ~inputs ~value ~backward =
     node value (Custom { name; inputs; backward }) inputs
 
+  (* Activations. The piecewise ones are compositions; the smooth ones are
+     one custom node each, with their closed-form derivative. *)
+
+  let positive a = T.gt a.value (T.scalar 0.)
+  let leaky_relu ?(slope = 0.01) a = where (positive a) a (scale slope a)
+
+  (** The exponential only sees [min x 0], so a large [x] can't overflow
+      into the branch that [where] discards (whose gradient would then be
+      [0 * inf]). *)
+  let elu ?(alpha = 1.0) a =
+    where (positive a) a (scale alpha (expm1 (clamp ~max:0. a)))
+
+  let gelu ?(approximate = false) a =
+    let x = a.value in
+    if not approximate then begin
+      let cdf = T.scale 0.5 (T.add_scalar 1. (T.erf (T.scale (1. /. Float.sqrt 2.) x))) in
+      let pdf =
+        T.scale (1. /. Float.sqrt (2. *. Float.pi)) (T.exp (T.scale (-0.5) (T.square x)))
+      in
+      custom ~name:"gelu" ~inputs:[ a ] ~value:(T.mul x cdf)
+        ~backward:(fun g -> [ Some (T.mul g (T.add cdf (T.mul x pdf))) ])
+    end
+    else begin
+      let k = Float.sqrt (2. /. Float.pi) and c = 0.044715 in
+      let x2 = T.square x in
+      let t = T.tanh (T.scale k (T.add x (T.scale c (T.mul x2 x)))) in
+      let half_1pt = T.scale 0.5 (T.add_scalar 1. t) in
+      custom ~name:"gelu_tanh" ~inputs:[ a ] ~value:(T.mul x half_1pt)
+        ~backward:(fun g ->
+          (* 0.5 (1 + t) + 0.5 x (1 - t²) k (1 + 3 c x²) *)
+          let dt =
+            T.mul
+              (T.scale (0.5 *. k) (T.mul x (T.add_scalar 1. (T.neg (T.square t)))))
+              (T.add_scalar 1. (T.scale (3. *. c) x2))
+          in
+          [ Some (T.mul g (T.add half_1pt dt)) ])
+    end
+
+  let silu a =
+    let x = a.value in
+    let s = T.sigmoid x in
+    custom ~name:"silu" ~inputs:[ a ] ~value:(T.mul x s)
+      ~backward:(fun g ->
+        (* s (1 + x (1 - s)) *)
+        [ Some (T.mul g (T.mul s (T.add_scalar 1. (T.mul x (T.add_scalar 1. (T.neg s)))))) ])
+
+  (** [log (1 + e^(beta x)) / beta], and [x] itself where [beta x] exceeds
+      [threshold], as PyTorch computes it. *)
+  let softplus ?(beta = 1.0) ?(threshold = 20.0) a =
+    let x = a.value in
+    let z = T.scale beta x in
+    let linear = T.gt z (T.scalar threshold) in
+    let value = T.where linear x (T.scale (1. /. beta) (T.log1p (T.exp z))) in
+    custom ~name:"softplus" ~inputs:[ a ] ~value
+      ~backward:(fun g -> [ Some (T.mul g (T.where linear (T.scalar 1.) (T.sigmoid z))) ])
+
   (* ---------------------------------------------------------------------- *)
   (* Backward pass                                                           *)
   (* ---------------------------------------------------------------------- *)

@@ -445,3 +445,54 @@ PyTorch 2.0.1 in float64 on all 12 threads (`bench/torch_ops.py`):
   needs a C kernel before cross-entropy over a vocabulary uses it in a
   training loop.
 
+
+## Phases 9–10: layers, checkpoints, losses, optimizers (2026-11-27)
+
+Phases 9 and 10 add layers, checkpoints, losses, four optimizers and
+learning-rate schedules. The ground rule for them is that code that doesn't
+use them pays nothing, so this section is an A/B check. The previous commit
+and this one were built in release mode and run alternately on the same
+machine (Apple M2 Pro, 8 threads, MNIST, batch 64, Adam).
+
+### Training is unchanged
+
+Median of three alternating full-epoch runs (ms per step; epoch seconds in
+brackets):
+
+| Model | Backend | Before | After |
+|---|---|---|---|
+| MLP 784–128–10 | pure OCaml | 0.613 (0.57) | 0.612 (0.57) |
+| CNN | pure OCaml | 4.42 (4.15) | 4.37 (4.10) |
+| MLP 784–128–10 | BLAS f64 | 0.223 (0.21) | 0.224 (0.21) |
+| CNN | BLAS f64 | 3.39 (3.17) | 3.38 (3.17) |
+
+The BLAS MLP row is the median of six further alternating runs, because the
+first three were too close to call (0.217–0.228 ms on both sides).
+
+The optimizer kernels changed: Adam's C kernel gained a flag for AdamW's
+decoupled decay, SGD's one for Nesterov momentum, and Adam now counts steps
+per parameter. The `bench_ops` optimizer rows, alternating four times
+(µs per call), show no change:
+
+| Op | Before | After |
+|---|---|---|
+| Adam step (MLP, 101,770 params), BLAS f64 | 47–50 | 46–52 |
+| SGD + momentum step (MLP), BLAS f64 | 38–45 | 36–42 |
+| Adam step, pure OCaml | 74–88 | 75–77 |
+| SGD + momentum step, pure OCaml | 51–61 | 51–53 |
+
+### What the numbers say
+
+- **The common layers take the same path as before.** `Linear` with a bias
+  on a 2-D input is still one fused `Var.linear` node. A square,
+  undilated, ungrouped convolution is still `im2col` and one matmul.
+- **The new layers are compositions for now,** as the roadmap planned.
+  Batch norm, layer norm and attention are built from `Var` ops, which
+  makes several passes over memory where a fused kernel would make one. The
+  convolutions that `im2col` can't do (dilation, different strides per
+  axis) take one strided slice per kernel position. Grouped convolutions
+  are one batched matmul. Fused kernels come once a reference model's
+  profile (Phase 12) shows where the time goes.
+- **Cross-entropy with label smoothing or class weights avoids `gather`.**
+  It multiplies the log-probabilities by one constant target matrix, so the
+  BLAS backend's slow `gather` (see Phases 7–8) stays off the training path.

@@ -3,9 +3,13 @@
 A small PyTorch-like neural network library written from scratch in OCaml.
 It provides n-dimensional tensors with a NumPy-style API (slicing,
 broadcasting, indexing, batched matmul, `.npy` files), reverse-mode
-automatic differentiation of all of it, custom differentiable ops, layers,
-losses, SGD and Adam optimizers, and a complete MNIST training pipeline. The core uses no numerical libraries, only the OCaml standard
-library. An optional second backend, `flockml.blas`, runs the same code on
+automatic differentiation of all of it, custom differentiable ops, and the
+layers modern models are built from: convolutions, normalisation,
+embeddings, attention and recurrent cells, plus user-defined layers. It has
+PyTorch's losses, optimizers (SGD, Adam, AdamW, RMSprop, Adagrad) and
+learning-rate schedules, checkpoints in the safetensors format that PyTorch
+reads and writes, and a complete MNIST training pipeline. The core uses no
+numerical libraries, only the OCaml standard library. An optional second backend, `flockml.blas`, runs the same code on
 Bigarrays with BLAS, in float64 or float32.
 
 On MNIST, a two-layer MLP reaches **97.3%** test accuracy after 3 epochs, and a
@@ -127,16 +131,97 @@ let v, g = Var.value_and_grad f (Tensor.of_array [| 2 |] [| 1.; 3. |])
 and `clip_grad_value`, and `detect_anomaly`, which names the first
 operation that produces a NaN or infinity, forward or backward.
 
+### Your own layers
+
+A model is a value of the `Layer.t` variant, and anything the built-in
+layers don't cover is a `Custom` layer: a forward function, plus the
+parameters, buffers and sublayers it uses, named so that checkpoints and
+`named_params` see them. A ResNet block:
+
+```ocaml
+let block ~in_c ~out_c =
+  let conv1 = Layer.conv2d ~bias:false ~padding:1 ~in_channels:in_c ~out_channels:out_c ~kernel:3 ()
+  and bn1 = Layer.batch_norm out_c
+  and conv2 = Layer.conv2d ~bias:false ~padding:1 ~in_channels:out_c ~out_channels:out_c ~kernel:3 ()
+  and bn2 = Layer.batch_norm out_c in
+  Layer.custom ~name:"BasicBlock"
+    ~children:[ ("conv1", conv1); ("bn1", bn1); ("conv2", conv2); ("bn2", bn2) ]
+    (fun ~train ?rng x ->
+      let f l x = Layer.forward ~train ?rng l x in
+      Var.relu (Var.add x (f bn2 (f conv2 (Var.relu (f bn1 (f conv1 x)))))))
+```
+
+`Layer.residual f` is `x + f x`, and `Layer.sequential` chains layers. A
+model with several inputs or outputs can be an ordinary OCaml function over
+a record of layers. `Layer.named_params` gives paths such as
+`"3.conv1.w"`. `Layer.summary model ~input_shape` returns a table of each
+layer's output shape and parameter count. The explicit `~train` flag
+switches dropout and batch norm between training and evaluation.
+
+### Checkpoints
+
+```ocaml
+Checkpoint.save ~optim:opt "run.safetensors" model;          (* model + optimizer *)
+ignore (Checkpoint.load ~optim:opt "run.safetensors" model)  (* resumes exactly *)
+```
+
+The file is safetensors, so PyTorch reads it with `safetensors.torch.load_file`
+and writes it with `save_file`. FlockML's weights are the transposes of
+PyTorch's (a linear layer's `w` is `[in; out]`), and images are NHWC.
+`python3 scripts/check_torch_interop.py` moves a ResNet-style CNN and a
+small transformer between FlockML and PyTorch in both directions and checks
+that the logits agree (to about 1e-15). Loading reports missing, unexpected
+and mismatched entries, and converts between float32 and float64.
+
+### Losses, optimizers and schedules
+
+Each loss, optimizer and schedule matches the PyTorch one of the same name:
+the tests compare values, gradients, and parameters after 10 optimizer
+steps against PyTorch's own outputs.
+
+```ocaml
+(* AdamW, decaying only the weight matrices (not biases or norm scales) *)
+let decay, no_decay =
+  List.partition (fun (_, p) -> Array.length (Var.shape p) >= 2) (Layer.named_params model)
+in
+let opt =
+  Optim.adamw ~lr:3e-4 ~weight_decay:0.1
+    ~groups:[ Optim.group ~weight_decay:0. (List.map snd no_decay) ]
+    (List.map snd decay)
+in
+let schedule = Schedule.(warmup ~steps:200 (cosine ~lr:3e-4 ~total:5000 ())) in
+for step = 0 to 5199 do
+  Optim.set_lr opt (schedule step);
+  Optim.zero_grad opt;
+  (* gradients add up until zero_grad: accumulate over 4 micro-batches *)
+  for _ = 1 to 4 do
+    let x, labels = next_batch () in
+    let loss = Loss.cross_entropy ~label_smoothing:0.1 (Layer.forward ~train:true model x) labels in
+    Var.backward (Var.scale 0.25 loss)
+  done;
+  ignore (Var.clip_grad_norm ~max_norm:1.0 (Optim.params opt));
+  Optim.step opt
+done
+```
+
+Every loss takes `?reduction` (`` `Mean ``, `` `Sum `` or `` `None ``).
+`cross_entropy` accepts logits with extra axes (`[batch; time; classes]`;
+the classes are always the last axis), class weights and label smoothing.
+`bce_with_logits` is stable without an epsilon, and is the one to use for
+binary classification.
+
 ## What's included
 
 | Module | Contents |
 |---|---|
 | `Tensor` | Row-major float tensors with a NumPy-level API: broadcasting, slicing and slice assignment, `permute` / `concat` / `stack` / `split` / `pad` / `flip` / `tile`, `index_select` / `gather` / `scatter_add`, comparisons, `where`, 20 elementwise functions, reductions (sum, mean, max, min, prod, var, std, logsumexp, cumsum) along any axes, batched and broadcasting `matmul`, construction (`arange`, `linspace`, `eye`) and sampling. Also a blocked, multithreaded `gemm_`, fused in-place optimizer updates, and `im2col` / `col2im` / max-pool kernels for convolution |
 | `Var` | Reverse-mode autodiff of every tensor op that has a gradient, including numerically stable `log_softmax`, `logsumexp` and `sigmoid`, fused `linear` and `softmax_cross_entropy`, and batched matmul. Also custom ops (`Var.custom`), a functional API (`value_and_grad`, `gradient`), freezing, gradient clipping, anomaly detection, and a `no_grad` mode for inference |
-| `Layer` | `linear`, `conv2d`, `max_pool2d`, `relu`, `sigmoid`, `tanh`, `flatten`, `dropout`, `sequential` |
-| `Loss` | Mean squared error, softmax cross-entropy, binary cross-entropy |
-| `Optim` | SGD (with momentum and weight decay) and Adam (with bias correction) |
-| `Init` | Xavier-uniform and He-normal weight initialisation |
+| `Layer` | Layers as data (see the table below), user-defined `custom` layers and `residual`; named parameters and buffers, `state_dict`, `summary` |
+| `Loss` | MSE, L1, smooth L1, Huber, cross-entropy (class weights, label smoothing, sequences), NLL, binary cross-entropy (on probabilities or stable on logits), KL divergence; all with `?reduction` |
+| `Optim` | SGD (momentum, Nesterov, weight decay), Adam, AdamW, RMSprop and Adagrad, each one fused kernel per parameter; parameter groups; a `state_dict` for checkpoints |
+| `Schedule` | Learning-rate schedules as functions of the step: step, multi-step, exponential, cosine, linear, warmup, one-cycle, and reduce-on-plateau |
+| `Init` | He (normal), Kaiming (uniform, PyTorch's default), Xavier (uniform and normal), orthogonal, constant; any of them through a constructor's `?init` |
+| `Checkpoint`, `Safetensors` | Save and load a model and its optimizer as `.safetensors`, readable by PyTorch; read and write any safetensors file |
 | `Dataset` | In-memory datasets, Fisher–Yates shuffling, lazy mini-batches, train/validation splits |
 | `Mnist` | IDX file loader for MNIST and Fashion-MNIST |
 | `Metrics` | Argmax predictions, accuracy, confusion matrices |
@@ -147,6 +232,19 @@ operation that produces a NaN or infinity, forward or backward.
 | `Make`, `S`, `Default` | `Flockml.Make (T)` builds all of the above for a tensor backend `T`. The top-level modules are `Default = Make (Tensor)` |
 | `Layout`, `Tensor_derived` | Shape and broadcasting arithmetic, and the tensor functions written once for every backend (compositions, and every structural op as one strided copy) |
 | `Tensor_blas` (`flockml.blas`) | The optional backend: `F64` and `F32` tensors on Bigarrays, matmul through BLAS (Accelerate or OpenBLAS), every other kernel in vectorised C |
+
+The layers (`Layer.*`), each checked against PyTorch's output and with a
+gradient check:
+
+| Kind | Constructors |
+|---|---|
+| Linear | `linear` (any number of leading axes, optional bias) |
+| Convolution (NHWC) | `conv2d` (rectangular kernels, per-axis stride, padding and dilation, `groups` for depthwise), `conv1d`, `conv_transpose2d` |
+| Pooling | `max_pool2d` and `avg_pool2d` (with padding), `global_avg_pool` |
+| Activations | `relu`, `leaky_relu`, `elu`, `gelu` (exact or tanh), `silu`, `softplus`, `sigmoid`, `tanh`, `softmax`, `log_softmax`, `identity` |
+| Normalisation | `batch_norm` (1-D and 2-D, running statistics), `layer_norm`, `group_norm` |
+| Sequence | `embedding`, `rnn`, `lstm`, `gru` (whole sequences with `run`, or one `step`), `multi_head_attention` (optional causal mask; `attention` for cross-attention) |
+| Structure | `sequential`, `residual`, `flatten`, `dropout`, `custom` |
 
 Every public function is documented in its interface: an `.mli`, an
 `*_intf.ml`, or the `module type S` at the top of each functor's file.
@@ -311,7 +409,7 @@ The interfaces stay simple; the speed comes from how the kernels in
 
 ## Testing
 
-`dune test` runs 1045 tests in eight executables, which can also be run one
+`dune test` runs 1351 tests in ten executables, which can also be run one
 at a time. The suites themselves are functors over a backend (`test/suites/`),
 so the same tests run on both backends:
 
@@ -320,11 +418,13 @@ so the same tests run on both backends:
 | `test_tensor` | construction, broadcasting rules, reductions, linear algebra, in-place ops |
 | `test_autograd` | graph mechanics and a gradient check of every differentiable op; custom ops, freezing, clipping, anomaly detection and the functional API |
 | `test_nn` | initialisation statistics, losses, layers, batching, metrics |
-| `test_optim` | SGD, momentum, weight decay and Adam against hand-computed updates |
+| `test_optim` | every optimizer against hand-computed updates; parameter groups, optimizer state, gradient accumulation |
 | `test_conv` | `im2col`/`col2im` adjointness, gradient checks of `im2col`, `max_pool2d` and a full conv layer, graph export |
 | `test_kernels` | every fast kernel against a plain reference on awkward shapes, gradient checks of the fused ops, gradient-buffer ownership, and bit-identical results at 1, 2, 3 and 8 threads |
 | `test_numpy` | the NumPy-level API against NumPy's own outputs (`.npy` fixtures written by `test/fixtures/gen.py`), plus empty and size-1 axes, NaN rules, errors, the `.npy` reader and the global generator |
-| `test_backends` | all seven suites again on `Tensor_blas.F64`, then every op, a few MLP and CNN training steps and an attention block's gradients on both backends, checked to agree (to 1e-11 in float64, 1e-5 in float32) |
+| `test_layers` | gradient checks of every layer, with respect to its input and parameters; named parameters, custom and residual layers, summaries; `state_dict`, safetensors and checkpoints, including a resumed run that matches an uninterrupted one bit for bit; a ResNet-style CNN and a small transformer, written with the public API, that train |
+| `test_torch` | layers, losses (values and gradients), optimizers (parameters after 10 steps) and schedules against PyTorch's own outputs (fixtures written by `test/fixtures/gen_torch.py`), and a safetensors file with every dtype |
+| `test_backends` | all nine suites again on `Tensor_blas.F64`, then every op, a few training steps of MLPs, CNNs and the Phase 9 layers, and an attention block's gradients on both backends, checked to agree (to 1e-11 in float64, 1e-5 in float32) |
 
 The central tool is the **gradient check** in `test/suites/helpers.ml`. It compares
 every gradient that autograd computes against a central finite difference,
@@ -358,8 +458,9 @@ current goal: [ROADMAP.md](ROADMAP.md) has the plan, and
 | 512² matmul | 1.8 GFLOP/s | 15 GFLOP/s | 106 GFLOP/s | 660 GFLOP/s | 2234 GFLOP/s | NumPy 50 (1 thread), 144 (12) |
 
 The first three columns are the pure-OCaml backend. Phases 1–5 of the
-roadmap (speed) and Phases 7–8 (the NumPy-level API and complete autograd)
-are done. Phase 9 (open layers, checkpoints) is next.
+roadmap (speed) and Phases 7–10 (the NumPy-level API, complete autograd,
+open layers with checkpoints, and PyTorch's losses, optimizers and
+schedules) are done. Phase 11 (the data pipeline) is next.
 
 ### Benchmarks
 
@@ -408,14 +509,20 @@ lib/
     autograd_intf.ml       module type S: the autograd engine's interface
     autograd.ml            Make (T : Tensor_intf.S): graph ADT + backward pass
   nn/
-    init.ml                Xavier / He initialisation
-    layer.ml               layers as an ADT (Linear, Conv2d, Relu, Sequential...)
-    loss.ml                MSE, cross-entropy, binary cross-entropy
-  optim/optim.ml           SGD (+momentum, weight decay), Adam
+    init.ml                initialisation schemes (He, Kaiming, Xavier, orthogonal...)
+    layer.ml               layers as an ADT (Linear, Conv2d, Attention, Custom...),
+                           named parameters, state_dict, summary
+    loss.ml                regression and classification losses
+    checkpoint.ml          a model and its optimizer in one safetensors file
+  optim/
+    optim.ml               SGD, Adam, AdamW, RMSprop, Adagrad; parameter groups
+    schedule.ml            learning-rate schedules
   data/
     dataset.ml             in-memory dataset, shuffling, lazy mini-batches
     mnist.ml               IDX file loader (MNIST and Fashion-MNIST)
-  io/npy.ml                NumPy .npy reader and writer
+  io/
+    npy.ml                 NumPy .npy reader and writer
+    safetensors.ml         safetensors reader and writer
   metrics.ml               accuracy, confusion matrix
   viz/graphviz.ml          export a computational graph to DOT
   parallel/parallel.ml(i)  domain pool: parallel_for over disjoint ranges
@@ -431,13 +538,18 @@ test/
   suites/                  one OUnit2 suite per subsystem, as a functor over a backend
   test_*.ml                runs each suite on the default backend
   test_backends.ml         every suite on the BLAS backend, and cross-backend agreement
-  fixtures/                NumPy reference outputs, and gen.py that writes them
+  fixtures/                NumPy reference outputs, and gen.py that writes them;
+                           torch/ holds PyTorch's, written by gen_torch.py
 bench/                     training, matmul and per-op benchmarks; PyTorch/NumPy baselines; RESULTS.md
-scripts/download_mnist.sh  dataset download
+scripts/
+  download_mnist.sh        dataset download
+  check_torch_interop.py   checkpoints between FlockML and PyTorch, both ways
+  interop.ml               its FlockML half
 ```
 
 Each module in `nn/`, `optim/`, `data/`, `io/`, `metrics.ml` and `viz/` is a
-functor, with its documented signature `S` in the same file.
+functor (except `Schedule`, which needs no backend), with its documented
+signature `S` in the same file.
 
 ## License
 

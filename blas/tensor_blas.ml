@@ -104,6 +104,23 @@ external sgd_c : 'k buf -> 'k buf -> 'k buf -> float array -> int -> int -> unit
   = "fb_sgd_byte" "fb_sgd"
 [@@noalloc]
 
+external rmsprop_c :
+  'k buf ->
+  'k buf ->
+  'k buf ->
+  'k buf ->
+  'k buf ->
+  float array ->
+  int ->
+  int ->
+  unit = "fb_rmsprop_byte" "fb_rmsprop"
+[@@noalloc]
+
+external adagrad_c :
+  'k buf -> 'k buf -> 'k buf -> float array -> int -> int -> unit
+  = "fb_adagrad_byte" "fb_adagrad"
+[@@noalloc]
+
 external im2col_c : bool -> 'k buf -> 'k buf -> int array -> int -> int -> unit
   = "fb_im2col_byte" "fb_im2col"
 [@@noalloc]
@@ -743,15 +760,49 @@ module Make (K : KIND) : S = struct
   let adam_update_ ~lr ~beta1 ~beta2 ~eps ~weight_decay ~bc1 ~bc2 ~param ~grad
       ~m ~v =
     check_all_same ~fn:"adam_update_" param [ grad; m; v ];
-    let h = [| lr; beta1; beta2; eps; weight_decay; bc1; bc2 |] in
+    let h = [| lr; beta1; beta2; eps; weight_decay; bc1; bc2; 0. |] in
+    Parallel.parallel_for ~work:6 (numel param) (fun lo hi ->
+        adam_c param.data grad.data m.data v.data h lo hi)
+
+  let adamw_update_ ~lr ~beta1 ~beta2 ~eps ~weight_decay ~bc1 ~bc2 ~param ~grad
+      ~m ~v =
+    check_all_same ~fn:"adamw_update_" param [ grad; m; v ];
+    let h = [| lr; beta1; beta2; eps; weight_decay; bc1; bc2; 1. |] in
     Parallel.parallel_for ~work:6 (numel param) (fun lo hi ->
         adam_c param.data grad.data m.data v.data h lo hi)
 
   let sgd_update_ ~lr ~momentum ~weight_decay ~param ~grad ~velocity =
     check_all_same ~fn:"sgd_update_" param [ grad; velocity ];
-    let h = [| lr; momentum; weight_decay |] in
+    let h = [| lr; momentum; weight_decay; 0. |] in
     Parallel.parallel_for ~work:2 (numel param) (fun lo hi ->
         sgd_c param.data grad.data velocity.data h lo hi)
+
+  let sgd_nesterov_update_ ~lr ~momentum ~weight_decay ~param ~grad ~velocity =
+    check_all_same ~fn:"sgd_nesterov_update_" param [ grad; velocity ];
+    let h = [| lr; momentum; weight_decay; 1. |] in
+    Parallel.parallel_for ~work:2 (numel param) (fun lo hi ->
+        sgd_c param.data grad.data velocity.data h lo hi)
+
+  let rmsprop_update_ ~lr ~alpha ~eps ~weight_decay ~momentum ~centered ~param
+      ~grad ~square_avg ~grad_avg ~momentum_buf =
+    check_all_same ~fn:"rmsprop_update_" param [ grad; square_avg ];
+    if centered then check_same_shape ~fn:"rmsprop_update_" param grad_avg;
+    if momentum > 0. then
+      check_same_shape ~fn:"rmsprop_update_" param momentum_buf;
+    let h =
+      [|
+        lr; alpha; eps; weight_decay; momentum; (if centered then 1. else 0.);
+      |]
+    in
+    Parallel.parallel_for ~work:6 (numel param) (fun lo hi ->
+        rmsprop_c param.data grad.data square_avg.data grad_avg.data
+          momentum_buf.data h lo hi)
+
+  let adagrad_update_ ~lr ~eps ~weight_decay ~param ~grad ~sum =
+    check_all_same ~fn:"adagrad_update_" param [ grad; sum ];
+    let h = [| lr; eps; weight_decay |] in
+    Parallel.parallel_for ~work:4 (numel param) (fun lo hi ->
+        adagrad_c param.data grad.data sum.data h lo hi)
 
   (* -------------------------------------------------------------------- *)
   (* Convolution helpers                                                   *)

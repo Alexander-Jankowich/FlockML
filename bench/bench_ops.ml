@@ -127,7 +127,7 @@ module Cases (B : Flockml.S) = struct
     let params = Layer.params model in
     let x = Var.const (randn [| 64; 784 |]) in
     let labels = Array.init 64 (fun i -> i mod 10) in
-    Var.backward (Loss.cross_entropy ~logits:(Layer.forward model x) ~labels);
+    Var.backward (Loss.cross_entropy (Layer.forward model x) labels);
     let n = Layer.num_params model in
     let adam = Optim.adam ~lr:1e-3 params
     and sgd = Optim.sgd ~momentum:0.9 ~lr:1e-3 params in

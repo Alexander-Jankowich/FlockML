@@ -522,16 +522,19 @@ static void K(softmax_ce_backward)(const T *lp, value labels, T *out,
 /* ------------------------------------------------------------------------ */
 
 /* One fused Adam step over [lo, hi): the formulas of adam_update_ in
-   tensor.ml. p_[7] = lr, beta1, beta2, eps, weight_decay, bc1, bc2. */
+   tensor.ml. h[8] = lr, beta1, beta2, eps, weight_decay, bc1, bc2, and
+   whether the decay is decoupled (AdamW: adamw_update_). */
 static void K(adam)(T *p, const T *g, T *m, T *v, const double *h, intnat lo,
                     intnat hi)
 {
   const T lr = (T)h[0], b1 = (T)h[1], b2 = (T)h[2], eps = (T)h[3];
   const T wd = (T)h[4], bc1 = (T)h[5], bc2 = (T)h[6];
+  const int decoupled = h[7] != 0;
   const T c1 = (T)1 - b1, c2 = (T)1 - b2, neg_lr = -lr;
-  const int decay = wd > 0;
+  const T keep = (T)(1.0 - h[0] * h[4]);
+  const int decay = wd > 0 && !decoupled;
   for (intnat i = lo; i < hi; i++) {
-    const T pi = p[i];
+    const T pi = decoupled ? keep * p[i] : p[i];
     T gi = g[i];
     if (decay) gi = gi + wd * pi;
     const T mi = b1 * m[i] + c1 * gi;
@@ -543,22 +546,76 @@ static void K(adam)(T *p, const T *g, T *m, T *v, const double *h, intnat lo,
   }
 }
 
-/* One SGD step: h[3] = lr, momentum, weight_decay. */
+/* One SGD step: h[4] = lr, momentum, weight_decay, and whether the
+   momentum is Nesterov's (sgd_nesterov_update_). */
 static void K(sgd)(T *p, const T *g, T *vel, const double *h, intnat lo,
                    intnat hi)
 {
   const T neg_lr = -(T)h[0], mom = (T)h[1], wd = (T)h[2];
-  const int decay = wd > 0;
+  const int decay = wd > 0, nesterov = h[3] != 0;
   for (intnat i = lo; i < hi; i++) {
     const T pi = p[i];
     T gi = g[i];
     if (decay) gi = gi + wd * pi;
-    if (mom == 0) p[i] = pi + neg_lr * gi;
+    if (nesterov) {
+      const T vi = mom * vel[i] + gi;
+      vel[i] = vi;
+      p[i] = pi + neg_lr * (gi + mom * vi);
+    }
+    else if (mom == 0) p[i] = pi + neg_lr * gi;
     else {
       const T vi = mom * vel[i] + gi;
       vel[i] = vi;
       p[i] = pi + neg_lr * vi;
     }
+  }
+}
+
+/* One RMSprop step (rmsprop_update_): h[6] = lr, alpha, eps, weight_decay,
+   momentum, centered. ga is only touched when centered, buf only with
+   momentum. */
+static void K(rmsprop)(T *p, const T *g, T *sq, T *ga, T *buf, const double *h,
+                       intnat lo, intnat hi)
+{
+  const T neg_lr = -(T)h[0], alpha = (T)h[1], eps = (T)h[2], wd = (T)h[3];
+  const T mom = (T)h[4], c = (T)1 - alpha;
+  const int centered = h[5] != 0, decay = wd > 0, use_mom = h[4] > 0;
+  for (intnat i = lo; i < hi; i++) {
+    const T pi = p[i];
+    T gi = g[i];
+    if (decay) gi = gi + wd * pi;
+    const T si = alpha * sq[i] + c * (gi * gi);
+    sq[i] = si;
+    T denom;
+    if (centered) {
+      T ai = ga[i];
+      ai = ai + c * (gi - ai);
+      ga[i] = ai;
+      denom = SQRT(si - ai * ai) + eps;
+    }
+    else denom = SQRT(si) + eps;
+    if (use_mom) {
+      const T bi = mom * buf[i] + gi / denom;
+      buf[i] = bi;
+      p[i] = pi + neg_lr * bi;
+    }
+    else p[i] = pi + neg_lr * (gi / denom);
+  }
+}
+
+/* One Adagrad step (adagrad_update_): h[3] = lr, eps, weight_decay. */
+static void K(adagrad)(T *p, const T *g, T *sum, const double *h, intnat lo,
+                       intnat hi)
+{
+  const T neg_lr = -(T)h[0], eps = (T)h[1], wd = (T)h[2];
+  const int decay = wd > 0;
+  for (intnat i = lo; i < hi; i++) {
+    const T pi = p[i];
+    T gi = g[i];
+    if (decay) gi = gi + wd * pi;
+    const T si = sum[i] + gi * gi;
+    sum[i] = si;
+    p[i] = pi + neg_lr * (gi / (SQRT(si) + eps));
   }
 }
 

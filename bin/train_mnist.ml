@@ -138,7 +138,7 @@ module Run (B : Flockml.S) = struct
       |> Seq.iteri (fun i (x, labels) ->
           Optim.zero_grad opt;
           let logits = Layer.forward ~train:true ~rng model (Var.const x) in
-          let loss = Loss.cross_entropy ~logits ~labels in
+          let loss = Loss.cross_entropy logits labels in
           Var.backward loss;
           Optim.step opt;
           running := !running +. Tensor.item (Var.value loss);

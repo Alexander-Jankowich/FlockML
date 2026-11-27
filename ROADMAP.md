@@ -5,7 +5,7 @@ This roadmap has two parts:
   PyTorch and NumPy on the same CPU. Phases 1–5 are done.
 - **[Part 2, feature parity (Phases 7–13)](#part-2-feature-parity-with-pytorch-and-numpy).**
   Be able to express the models people build with PyTorch and the array code
-  people write with NumPy. Phases 7 and 8 are done.
+  people write with NumPy. Phases 7–10 are done.
 
 # Part 1: Performance
 
@@ -457,8 +457,8 @@ better done after Phases 8 and 9 (see Part 2's order of work).
 FlockML is now fast: on this machine it trains MLPs and small CNNs faster
 than PyTorch. What it can't do yet is express most of the models people
 write in PyTorch, or most of the array code people write in NumPy. This is
-the gap, area by area, as of 2026-11-26, before Phases 7 and 8 closed the
-first two rows:
+the gap, area by area, as of 2026-11-26, before Phases 7–10 closed every
+row except the last:
 
 | Area | FlockML today | PyTorch / NumPy |
 |---|---|---|
@@ -662,7 +662,7 @@ README documents `custom` and the functional API.
   during the call take part in the backward pass (their ids are at least the
   input's id), so the parameters `f` uses get no gradients.
 
-## Phase 9: Open layers and model state
+## Phase 9: Open layers and model state ✅
 
 The closed `Layer.t` variant is the main reason a user can't write their own
 model in FlockML.
@@ -728,7 +728,64 @@ model in FlockML.
 - A FlockML checkpoint loads in PyTorch and gives the same logits. A script
   in `scripts/` checks this; `dune test` doesn't run it.
 
-## Phase 10: Losses, optimizers and schedules
+**Status.** Done 2026-11-27. All seven items are done, and all three
+"done when" conditions hold. The test count went from 1045 to 1351, and
+training speed is unchanged (A/B numbers in
+[bench/RESULTS.md](bench/RESULTS.md)). The breaking changes are listed in
+[CHANGES.md](CHANGES.md).
+- *The "done when" checks:*
+  - `test_layers` builds a ResNet-style CNN (residual blocks with projection
+    shortcuts, as `Custom` layers) and a one-block causal transformer
+    (token and position embeddings, pre-norm attention and MLP) from the
+    public API, and trains both.
+  - Saving and loading gives bit-identical outputs, on both backends.
+  - `scripts/check_torch_interop.py` moves a CNN (grouped and dilated
+    convolutions, batch norm, a residual) and a two-block transformer from
+    FlockML to PyTorch and back. The logits agree to 2e-15 both ways.
+- *Item 1:*
+  - `Custom` has a fourth field beyond the plan, `children`: the sublayers
+    its forward function calls. Through it, a custom layer's parameters,
+    buffers and sublayers all appear in `named_params`, checkpoints and
+    summaries.
+  - The constructor `Layer.custom` checks that the names are unique.
+- *Item 2:*
+  - `named_params` and `named_buffers` give names like `"0.conv1.w"`.
+  - `Residual` adds no component to the path.
+  - `state_dict` returns the live tensors, and `load_state_dict ?strict`
+    returns a report.
+- *Item 3:* the safetensors format is in `lib/io/safetensors.ml`, with no
+  dependencies: a JSON writer, and a parser just big enough for the header.
+  - It reads every float and integer dtype except the 8-bit floats, and
+    `test_torch` checks this against a file written by another
+    implementation.
+  - The optimizer goes in the same file, under `optim.`.
+  - A strict load that would fail raises before anything changes.
+- *Item 4:* every layer listed, each with a gradient check and a PyTorch
+  fixture.
+  - Weights are the transposes of PyTorch's, with gate orders and the
+    attention's packed projection kept, so converting a PyTorch checkpoint
+    is a transpose or permute per tensor.
+  - Convolutions take `im2col` when it applies. Dilation and different
+    strides per axis take strided slices. Groups are one batched matmul.
+    `conv_transpose2d` is a matmul and then `col2im`, as a custom node
+    whose backward pass is `im2col`.
+  - The activations are also in `Var` (`gelu`, `silu`, `softplus`, `elu`,
+    `leaky_relu`), so they can be used in functional code.
+  - Recurrent layers have `run` (with an optional initial state) and
+    `step`. Attention has `attention` for cross-attention, with a padding
+    mask.
+  - Not done:
+    - `groups` and `dilation` for `conv_transpose2d`.
+    - Bidirectional and multi-layer recurrent layers in a single
+      constructor. Stack them with `sequential` instead.
+    - Embedding's `padding_idx`.
+    - Fused kernels for the normalisation layers and attention, which wait
+      for a profile, as planned.
+- *Item 7:* `Init.scheme` and `?init` on every constructor that makes
+  weights. The defaults keep existing results: He-normal for linear and
+  convolution layers. The new layers default to what PyTorch uses.
+
+## Phase 10: Losses, optimizers and schedules ✅
 
 1. **Losses.**
    - A `?reduction` argument on every loss: `` `Mean ``, `` `Sum `` or
@@ -759,6 +816,41 @@ model in FlockML.
 optimizer matches PyTorch's parameters after 10 steps on a fixed problem.
 Both are checked with fixtures, as in ground rule 7. A resumed run gives the
 same result as one that never stopped.
+
+**Status.** Done 2026-11-27. All six items are done.
+- *The "done when" checks:* `test/fixtures/gen_torch.py` writes PyTorch's
+  outputs, and `test_torch` compares against them to 1e-10, on both
+  backends. They cover:
+  - 29 loss cases, value and gradient: every loss and reduction, class
+    weights, label smoothing, sequence logits, and logits of ±60.
+  - 11 optimizer configurations, by their parameters after 10 steps.
+  - 7 schedules.
+
+  In `test_layers`, a run interrupted by a checkpoint, resumed with AdamW,
+  Nesterov SGD and centered RMSprop, ends bit-identical to one that never
+  stopped.
+- *Item 1:* `cross_entropy` and `nll` now take their arguments
+  positionally, `cross_entropy logits labels`, because OCaml can't put
+  optional arguments in front of labelled ones only. This is listed in
+  `CHANGES.md`.
+  - The class axis is the last one, as everywhere in FlockML.
+  - The plain case is still the fused node. Class weights and label
+    smoothing multiply the log-probabilities by one constant target matrix,
+    so they don't need the BLAS backend's slow `gather`.
+- *Item 2:* `adamw_update_`, `sgd_nesterov_update_`, `rmsprop_update_` and
+  `adagrad_update_`, in OCaml and in C.
+  - In C, AdamW and Nesterov are flags on the existing Adam and SGD
+    kernels.
+  - Adam counts steps per parameter, as PyTorch does.
+- *Item 3:* `Optim.group ?lr ?weight_decay params`, passed as `~groups`.
+  `set_lr` scales every group by the same factor, which is what PyTorch's
+  schedulers do.
+- *Item 4:* `Schedule` (backend-independent): `step_decay`, `multi_step`,
+  `exponential`, `cosine`, `linear`, `warmup` (which wraps another
+  schedule), `one_cycle`, and the stateful `Plateau`.
+- *Items 5–6:* `Optim.state_dict` and `load_state_dict`, which
+  `Checkpoint` stores. Gradient accumulation is documented in the README,
+  and a test checks that two half batches give the full batch's gradient.
 
 ## Phase 11: Data pipeline
 
@@ -840,4 +932,6 @@ PyTorch versions, and their epoch times are recorded in `RESULTS.md`.
   the set of ops and layers it must replay is known, including `Custom`
   layers and ops.
 
-Phases 7 and 8 are done. CI (13.1) isn't set up yet. Phase 9 is next.
+Phases 7–10 are done. CI (13.1) isn't set up yet. Phase 11 (data) and
+Phase 12 (reference models) are next. Phase 6's graph replay can start now
+that the set of layers is known.

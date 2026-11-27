@@ -29,14 +29,14 @@ module type S = sig
   module Init : Init.S with type tensor = Tensor.t
   (** Weight initialisation. *)
 
-  module Layer : Layer.S with type var = Var.t
   (** Layers and models. *)
+  module Layer : Layer.S with type var = Var.t and type tensor = Tensor.t
 
-  module Loss : Loss.S with type var = Var.t
   (** Loss functions. *)
+  module Loss : Loss.S with type var = Var.t and type tensor = Tensor.t
 
-  module Optim : Optim.S with type var = Var.t
-  (** SGD and Adam. *)
+  (** SGD, Adam, AdamW, RMSprop and Adagrad, with parameter groups. *)
+  module Optim : Optim.S with type var = Var.t and type tensor = Tensor.t
 
   module Dataset : Dataset.S with type tensor = Tensor.t
   (** In-memory datasets and mini-batches. *)
@@ -50,6 +50,13 @@ module type S = sig
   module Npy : Npy.S with type tensor = Tensor.t
   (** Reading and writing NumPy [.npy] files. *)
 
+  module Safetensors : Safetensors.S with type tensor = Tensor.t
+  (** Reading and writing [.safetensors] files. *)
+
+  (** Saving and loading models and optimizers. *)
+  module Checkpoint :
+    Checkpoint.S with type layer = Layer.t and type optim = Optim.t
+
   module Graphviz : Graphviz.S with type var = Var.t
   (** Graph export to DOT. *)
 end
@@ -61,12 +68,14 @@ module Make (T : Tensor_intf.S) : S with module Tensor = T = struct
   module Var = Autograd.Make (T)
   module Init = Init.Make (T)
   module Layer = Layer.Make (T) (Var)
-  module Loss = Loss.Make (Var)
+  module Loss = Loss.Make (T) (Var)
   module Optim = Optim.Make (T) (Var)
   module Dataset = Dataset.Make (T)
   module Mnist = Mnist.Make (T) (Dataset)
   module Metrics = Metrics.Make (T)
   module Npy = Npy.Make (T)
+  module Safetensors = Safetensors.Make (T)
+  module Checkpoint = Checkpoint.Make (T) (Layer) (Optim) (Safetensors)
   module Graphviz = Graphviz.Make (T) (Var)
 end
 
@@ -79,6 +88,7 @@ module Layout = Layout
 module Tensor_derived = Tensor_derived
 module Parallel = Parallel
 module Rng = Rng
+module Schedule = Schedule
 
 let manual_seed = Rng.manual_seed
 
@@ -97,4 +107,6 @@ module Dataset = Default.Dataset
 module Mnist = Default.Mnist
 module Metrics = Default.Metrics
 module Npy = Default.Npy
+module Safetensors = Default.Safetensors
+module Checkpoint = Default.Checkpoint
 module Graphviz = Default.Graphviz

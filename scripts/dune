@@ -1,0 +1,6 @@
+; scripts/interop.exe is the FlockML half of check_torch_interop.py, which
+; moves checkpoints between FlockML and PyTorch. `dune test` doesn't run it.
+
+(executable
+ (name interop)
+ (libraries flockml))

@@ -47,22 +47,22 @@ module Make (B : Flockml.S) = struct
            ( "cross_entropy of uniform logits is log(classes)" >:: fun _ ->
              let l =
                Loss.cross_entropy
-                 ~logits:(Var.const (Tensor.zeros [| 2; 10 |]))
-                 ~labels:[| 3; 7 |]
+                 (Var.const (Tensor.zeros [| 2; 10 |]))
+                 [| 3; 7 |]
              in
              assert_float (Float.log 10.0) (Tensor.item (Var.value l)) );
            ( "cross_entropy confident and correct" >:: fun _ ->
              let l =
                Loss.cross_entropy
-                 ~logits:(Var.const (t [| 1; 3 |] [| 10.; 0.; 0. |]))
-                 ~labels:[| 0 |]
+                 (Var.const (t [| 1; 3 |] [| 10.; 0.; 0. |]))
+                 [| 0 |]
              in
              assert_float ~eps:1e-9
                (Float.log (1.0 +. (2.0 *. Float.exp (-10.0))))
                (Tensor.item (Var.value l)) );
            ( "cross_entropy gradient = softmax - onehot" >:: fun _ ->
              let logits = Var.param (Tensor.zeros [| 1; 3 |]) in
-             Var.backward (Loss.cross_entropy ~logits ~labels:[| 0 |]);
+             Var.backward (Loss.cross_entropy logits [| 0 |]);
              assert_tensor
                (t [| 1; 3 |] [| -2. /. 3.; 1. /. 3.; 1. /. 3. |])
                (Var.grad_exn logits) );
@@ -85,7 +85,7 @@ module Make (B : Flockml.S) = struct
                Layer.Linear
                  {
                    w = Var.param (range [| 2; 2 |]);
-                   b = Var.param (t [| 2 |] [| 10.; 20. |]);
+                   b = Some (Var.param (t [| 2 |] [| 10.; 20. |]));
                  }
              in
              let y = Layer.forward layer (Var.const (Tensor.ones [| 1; 2 |])) in

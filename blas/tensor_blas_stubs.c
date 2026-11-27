@@ -346,6 +346,8 @@ CAMLprim value fb_create(value kind, value vn)
   CAMLprim value f##_byte(value *a, int n) { (void)n; return f(a[0], a[1], a[2], a[3], a[4], a[5]); }
 #define BYTE7(f) \
   CAMLprim value f##_byte(value *a, int n) { (void)n; return f(a[0], a[1], a[2], a[3], a[4], a[5], a[6]); }
+#define BYTE8(f) \
+  CAMLprim value f##_byte(value *a, int n) { (void)n; return f(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]); }
 
 CAMLprim value fb_blas_name(value unit)
 {
@@ -558,6 +560,28 @@ CAMLprim value fb_sgd(value p, value g, value vel, value h, value lo,
   return Val_unit;
 }
 BYTE6(fb_sgd)
+
+CAMLprim value fb_rmsprop(value p, value g, value sq, value ga, value buf,
+                          value h, value lo, value hi)
+{
+  const double *hp = (const double *)h;
+  if (IS_F32(p))
+    rmsprop_s(S(p), S(g), S(sq), S(ga), S(buf), hp, Long_val(lo), Long_val(hi));
+  else
+    rmsprop_d(D(p), D(g), D(sq), D(ga), D(buf), hp, Long_val(lo), Long_val(hi));
+  return Val_unit;
+}
+BYTE8(fb_rmsprop)
+
+CAMLprim value fb_adagrad(value p, value g, value sum, value h, value lo,
+                          value hi)
+{
+  const double *hp = (const double *)h;
+  if (IS_F32(p)) adagrad_s(S(p), S(g), S(sum), hp, Long_val(lo), Long_val(hi));
+  else adagrad_d(D(p), D(g), D(sum), hp, Long_val(lo), Long_val(hi));
+  return Val_unit;
+}
+BYTE6(fb_adagrad)
 
 CAMLprim value fb_im2col(value scatter, value img, value cols, value geo,
                          value blo, value bhi)

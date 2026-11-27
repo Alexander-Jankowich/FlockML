@@ -589,6 +589,62 @@ module type S = sig
       [g' = g + weight_decay * p]; then [p <- p - lr * g'] if [momentum = 0],
       or [v <- momentum * v + g'; p <- p - lr * v]. *)
 
+  val adamw_update_ :
+    lr:float ->
+    beta1:float ->
+    beta2:float ->
+    eps:float ->
+    weight_decay:float ->
+    bc1:float ->
+    bc2:float ->
+    param:t ->
+    grad:t ->
+    m:t ->
+    v:t ->
+    unit
+  (** AdamW (Loshchilov & Hutter): the weight decay is decoupled from the
+      gradient. [p <- p * (1 - lr * weight_decay)], then the step of
+      {!adam_update_} with the raw gradient. *)
+
+  val sgd_nesterov_update_ :
+    lr:float ->
+    momentum:float ->
+    weight_decay:float ->
+    param:t ->
+    grad:t ->
+    velocity:t ->
+    unit
+  (** SGD with Nesterov momentum, in one pass, as PyTorch's
+      [SGD(nesterov=True)]: [g' = g + weight_decay * p],
+      [v <- momentum * v + g'], [p <- p - lr * (g' + momentum * v)]. *)
+
+  val rmsprop_update_ :
+    lr:float ->
+    alpha:float ->
+    eps:float ->
+    weight_decay:float ->
+    momentum:float ->
+    centered:bool ->
+    param:t ->
+    grad:t ->
+    square_avg:t ->
+    grad_avg:t ->
+    momentum_buf:t ->
+    unit
+  (** One RMSprop step, as PyTorch's: [g' = g + weight_decay * p],
+      [s <- alpha * s + (1 - alpha) * g'^2]. If [centered], also
+      [a <- a + (1 - alpha) * (g' - a)] and the denominator is
+      [sqrt (s - a^2) + eps], otherwise [sqrt s + eps]. Then
+      [p <- p - lr * g' / denom], or with momentum
+      [b <- momentum * b + g' / denom; p <- p - lr * b]. [grad_avg] is only
+      read when [centered], and [momentum_buf] only when [momentum > 0]: pass
+      any tensor of the right shape otherwise. *)
+
+  val adagrad_update_ :
+    lr:float -> eps:float -> weight_decay:float -> param:t -> grad:t -> sum:t -> unit
+  (** One Adagrad step: [g' = g + weight_decay * p], [s <- s + g'^2],
+      [p <- p - lr * g' / (sqrt s + eps)]. *)
+
   (** {1 Convolution helpers} *)
 
   val im2col : t -> kh:int -> kw:int -> stride:int -> padding:int -> t

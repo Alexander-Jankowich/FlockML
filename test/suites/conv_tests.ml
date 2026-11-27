@@ -93,7 +93,16 @@ module Make (B : Flockml.S) = struct
              [ r [| 2; 5; 5; 2 |]; r [| 18; 3 |]; r [| 3 |] ]
              (ternary (fun x w b ->
                   Layer.forward
-                    (Layer.Conv2d { w; b; kernel = 3; stride = 1; padding = 1 })
+                    (Layer.Conv2d
+                       {
+                         w;
+                         b = Some b;
+                         kernel = (3, 3);
+                         stride = (1, 1);
+                         padding = (1, 1);
+                         dilation = (1, 1);
+                         groups = 1;
+                       })
                     x));
          ]
 

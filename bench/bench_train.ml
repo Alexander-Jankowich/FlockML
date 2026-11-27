@@ -93,7 +93,7 @@ let run (module B : Flockml.S) kind =
     in
     let t1 = now () in
     let logits = Layer.forward ~train:true ~rng model (Var.const x) in
-    let loss = Loss.cross_entropy ~logits ~labels in
+    let loss = Loss.cross_entropy logits labels in
     let t2 = now () in
     Var.backward loss;
     let t3 = now () in
