@@ -38,6 +38,10 @@ let spec =
       " Use only the first N training examples (0 = all)" );
     ("--seed", Arg.Set_int seed, " Random seed (default 42)");
     ("--log-every", Arg.Set_int log_every, " Print the loss every N batches");
+    ( "--threads",
+      Arg.Int Parallel.set_num_threads,
+      " Threads for the tensor kernels (default: FLOCKML_THREADS, or up to 8)"
+    );
   ]
 
 (** The architecture named by [--model]: a 784-128-10 MLP, or a two-block
@@ -69,13 +73,14 @@ let build_model rng = function
   | other -> failwith ("unknown model " ^ other)
 
 (** Test accuracy and confusion matrix, predicting in batches of 256 with
-    dropout off. *)
+    dropout off and no graph recorded. *)
 let evaluate model (test : Dataset.t) =
   let preds =
-    Dataset.batches ~batch_size:256 test
-    |> Seq.map (fun (x, _) ->
-        Metrics.predict (Var.value (Layer.forward model (Var.const x))))
-    |> List.of_seq |> Array.concat
+    Var.no_grad (fun () ->
+        Dataset.batches ~batch_size:256 test
+        |> Seq.map (fun (x, _) ->
+            Metrics.predict (Var.value (Layer.forward model (Var.const x))))
+        |> List.of_seq |> Array.concat)
   in
   ( Metrics.accuracy ~predictions:preds ~labels:test.labels,
     Metrics.confusion_matrix ~num_classes:10 ~predictions:preds
@@ -99,10 +104,13 @@ let () =
     | "sgd" -> Optim.sgd ~momentum:0.9 ~lr:!lr params
     | _ -> Optim.adam ~lr:!lr params
   in
+  (* Wall-clock time: Sys.time would be process CPU time, which adds up the
+     time of every core once work runs in parallel. *)
+  let now = Unix.gettimeofday in
   for epoch = 1 to !epochs do
-    let t0 = Sys.time () in
+    let t0 = now () in
     let running = ref 0.0 and count = ref 0 in
-    Dataset.batches ~shuffle:true ~rng ~batch_size:!batch_size train
+    Dataset.batches ~shuffle:true ~reuse:true ~rng ~batch_size:!batch_size train
     |> Seq.iteri (fun i (x, labels) ->
         Optim.zero_grad opt;
         let logits = Layer.forward ~train:true ~rng model (Var.const x) in
@@ -117,9 +125,12 @@ let () =
           running := 0.0;
           count := 0
         end);
+    let t1 = now () in
     let acc, _ = evaluate model test in
-    Printf.printf "epoch %d done in %.1fs  test accuracy %.2f%%\n%!" epoch
-      (Sys.time () -. t0)
+    Printf.printf
+      "epoch %d done: train %.1fs, eval %.1fs  test accuracy %.2f%%\n%!" epoch
+      (t1 -. t0)
+      (now () -. t1)
       (100.0 *. acc)
   done;
   let acc, cm = evaluate model test in

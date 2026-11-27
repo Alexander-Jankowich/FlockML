@@ -50,7 +50,10 @@ module type S = sig
   (** A unique, increasing identifier, used for hashing and graph export. *)
 
   val zero_grad : t -> unit
-  (** Reset the gradient of a node (normally a parameter) to [None]. *)
+  (** Reset the gradient of a node (normally a parameter) to [None]. The
+      gradient tensor's storage is kept and reused by the next {!backward},
+      which overwrites it in place, so copy a gradient (e.g. with
+      {!Tensor_intf.S.copy}) if you need it after calling [zero_grad]. *)
 
   val detach : t -> t
   (** Same value, cut off from the graph. *)
@@ -91,6 +94,13 @@ module type S = sig
   val matmul : t -> t -> t
   (** 2-D matrix product: [[| m; k |]] x [[| k; n |]] -> [[| m; n |]]. *)
 
+  val linear : t -> t -> t -> t
+  (** [linear x w b] is [x · w + b] for [x : [| m; k |]], [w : [| k; n |]]
+      and a bias [b] that broadcasts to [[| m; n |]], as one node. It gives
+      the same result as [add (matmul x w) b] (up to rounding), with one pass
+      over the output and no intermediate tensor. Its backward pass writes the
+      weight gradient directly into the parameter's gradient buffer. *)
+
   val transpose : t -> t
   (** 2-D transpose. *)
 
@@ -120,6 +130,12 @@ module type S = sig
   val log_softmax : t -> t
   (** Numerically stable log-softmax along the last axis. *)
 
+  val softmax_cross_entropy : t -> int array -> t
+  (** [softmax_cross_entropy logits labels] is the mean over the batch of
+      [-log_softmax(logits)[label]], for [[| batch; classes |]] logits and
+      one label per row, as a single scalar node. Its gradient with respect
+      to the logits is [(softmax - one_hot labels) / batch]. *)
+
   val im2col : t -> kh:int -> kw:int -> stride:int -> padding:int -> t
   (** See {!Tensor_intf.S.im2col}. The only primitive conv2d needs. *)
 
@@ -128,6 +144,12 @@ module type S = sig
       gradient flows only to the element that won each window. *)
 
   (** {1 Backpropagation} *)
+
+  val no_grad : (unit -> 'a) -> 'a
+  (** [no_grad f] runs [f] without recording a graph: every operation inside
+      returns a constant, with no gradient and no link to its inputs. Use it
+      for evaluation and inference, where it saves building (and keeping
+      alive) a graph that will never be differentiated. *)
 
   val backward : t -> unit
   (** [backward loss] computes d loss / d node for every node in the graph that

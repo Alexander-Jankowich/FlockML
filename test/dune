@@ -3,5 +3,5 @@
 ; `dune test` runs them all.
 
 (tests
- (names test_tensor test_autograd test_nn test_optim test_conv)
+ (names test_tensor test_autograd test_nn test_optim test_conv test_kernels)
  (libraries flockml ounit2))

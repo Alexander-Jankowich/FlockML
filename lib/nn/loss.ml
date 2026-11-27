@@ -2,15 +2,16 @@
     it. *)
 let mse pred target = Var.mean (Var.pow (Var.sub pred target) 2.0)
 
-(** [-sum (one_hot labels * log_softmax logits) / batch]. The one-hot mask
-    picks out [-log p(correct class)] for each row, and the sum is averaged
-    over the batch. With all-zero logits the loss is [log num_classes]. *)
-let cross_entropy ~logits ~labels =
-  let batch = (Var.shape logits).(0) in
-  let lp = Var.log_softmax logits in
-  let num_classes = (Var.shape logits).(1) in
-  let y = Var.const (Tensor.one_hot ~num_classes labels) in
-  Var.scale (-1. /. float_of_int batch) (Var.sum (Var.mul y lp))
+(** [-sum (one_hot labels * log_softmax logits) / batch]: the mean over the
+    batch of [-log p(correct class)]. With all-zero logits the loss is
+    [log num_classes].
+
+    It is a single fused {!Var.softmax_cross_entropy} node rather than a
+    composition of [log_softmax], [mul], [sum] and [scale]. That gives the
+    same value, but skips building the one-hot matrix and three
+    intermediates, and its backward pass is the closed form
+    [(softmax - one_hot) / batch]. *)
+let cross_entropy ~logits ~labels = Var.softmax_cross_entropy logits labels
 
 (** A direct translation of [-mean (t log p + (1 - t) log (1 - p))] into Var
     ops, with [eps] added inside each log so neither is ever [log 0]. *)

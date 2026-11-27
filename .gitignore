@@ -4,7 +4,7 @@ _opam/
 .merlin
 
 # datasets and generated artifacts
-data/
+/data/
 *.dot
 *.svg
 *.png

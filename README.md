@@ -6,7 +6,9 @@ layers, losses, SGD and Adam optimizers, and a complete MNIST training
 pipeline. It uses no numerical libraries, only the OCaml standard library.
 
 On MNIST, a two-layer MLP reaches **97.3%** test accuracy after 3 epochs, and a
-small CNN reaches **98.2%**.
+small CNN reaches **98.2%**. Training is about as fast as PyTorch on the same
+CPU: an MLP epoch takes 0.57 s and a CNN epoch 4.1 s on 8 threads of an
+Apple M2 Pro.
 
 ## Quick start
 
@@ -59,8 +61,8 @@ logging.
 
 | Module | Contents |
 |---|---|
-| `Tensor` | Row-major float tensors: NumPy-style broadcasting, reductions along any axis, `matmul`, reshape, random initialisation, in-place ops for optimizers, and `im2col` / `col2im` / max-pool kernels for convolution |
-| `Var` | Reverse-mode autodiff over 21 primitive ops, including numerically stable `log_softmax` and `sigmoid` |
+| `Tensor` | Row-major float tensors: NumPy-style broadcasting, reductions along any axis, a blocked, multithreaded `matmul`/`gemm_`, reshape, random initialisation, fused in-place optimizer updates, and `im2col` / `col2im` / max-pool kernels for convolution |
+| `Var` | Reverse-mode autodiff over 23 primitive ops, including numerically stable `log_softmax` and `sigmoid`, fused `linear` and `softmax_cross_entropy`, and a `no_grad` mode for inference |
 | `Layer` | `linear`, `conv2d`, `max_pool2d`, `relu`, `sigmoid`, `tanh`, `flatten`, `dropout`, `sequential` |
 | `Loss` | Mean squared error, softmax cross-entropy, binary cross-entropy |
 | `Optim` | SGD (with momentum and weight decay) and Adam (with bias correction) |
@@ -69,6 +71,7 @@ logging.
 | `Mnist` | IDX file loader for MNIST and Fashion-MNIST |
 | `Metrics` | Argmax predictions, accuracy, confusion matrices |
 | `Graphviz` | Export any computation graph to DOT for visualisation |
+| `Parallel` | A small pool of OCaml 5 domains that the tensor kernels use for data parallelism |
 
 Every public function is documented in its interface (`.mli` or `*_intf.ml`).
 Run `dune build @doc` to generate HTML documentation in
@@ -76,13 +79,18 @@ Run `dune build @doc` to generate HTML documentation in
 
 ## Results
 
-Measured on a laptop CPU, single-threaded, release profile, with Adam at
-learning rate 1e-3 and batch size 64:
+Measured on an Apple M2 Pro, release profile, with Adam at learning rate
+1e-3 and batch size 64:
 
-| Model | Data | Parameters | Test accuracy | Time per epoch |
-|---|---|---|---|---|
-| MLP 784–128–10 | MNIST, 3 epochs | 101,770 | 97.29% | ~17 s |
-| CNN (2 × conv/pool, linear) | MNIST, 3 epochs | 9,098 | 98.20% | ~95 s |
+| Model | Data | Parameters | Test accuracy | Epoch, 8 threads | Epoch, 1 thread |
+|---|---|---|---|---|---|
+| MLP 784–128–10 | MNIST, 3 epochs | 101,770 | 97.29% | 0.57 s | 2.1 s |
+| CNN (2 × conv/pool, linear) | MNIST, 3 epochs | 9,098 | 98.20% | 4.1 s | 14.5 s |
+
+Times are wall clock, for training only. The results don't depend on the
+thread count: every kernel gives bit-identical output however many threads
+run it. [bench/RESULTS.md](bench/RESULTS.md) has the per-phase breakdown and
+the PyTorch comparison.
 
 The CNN reaches a higher accuracy with less than a tenth of the MLP's
 parameters, because each convolution filter is shared across the whole image.
@@ -102,6 +110,8 @@ are mistaken for which. For the MLP run above, the most common mistakes were
 --seed N            random seed (default 42)
 --log-every N       print the running loss every N batches (default 100)
 --data-dir DIR      location of the IDX files (default data/mnist)
+--threads N         threads for the tensor kernels (default: FLOCKML_THREADS,
+                    or the recommended domain count capped at 8)
 ```
 
 For Fashion-MNIST, run `./scripts/download_mnist.sh fashion` and pass
@@ -166,11 +176,44 @@ the autograd engine, layers and optimizers unchanged.
   before exponentiating; `sigmoid` never evaluates `exp` of a large positive
   number; binary cross-entropy guards its logarithms with an epsilon.
 - **Laziness for data.** `Dataset.batches` returns a `Seq.t`, so each
-  mini-batch is copied out only when the training loop asks for it.
+  mini-batch is copied out only when the training loop asks for it. With
+  `~reuse:true`, every batch is copied into the same buffer.
+
+### How it is fast
+
+The interfaces stay simple; the speed comes from how the kernels in
+`tensor.ml` are written.
+
+- **Matmul** follows the GotoBLAS design, scaled down:
+  - C is cut into tiles, and each tile is one parallel task.
+  - Each task packs its rows of A and columns of B into contiguous buffers,
+    which also absorbs any transpose.
+  - A 4×4 micro-kernel keeps 16 accumulators in registers. On arm64,
+    `ocamlopt` compiles each multiply-add to a single `fmadd` instruction.
+  - This reaches about 15 GFLOP/s on one core and over 100 on eight.
+- **No closures in hot loops.** A closure call boxes the float it returns,
+  which is one allocation per element. Every kernel is a plain loop over
+  `float array`s, with shapes checked once up front and unchecked access
+  inside.
+- **Fewer, bigger operations.** These are each a single kernel, with no
+  intermediate tensors:
+  - `Var.linear` (matmul plus bias), and the cross-entropy loss;
+  - Adam and SGD updates;
+  - the matmul backward pass, which writes weight gradients straight into a
+    reused gradient buffer.
+- **Branch-free where the data is random.** `relu` and max-pooling choose
+  with arithmetic instead of `if`, because a comparison of activations is
+  mispredicted about half the time.
+- **Multicore without changing results.**
+  - `Parallel` splits each kernel's output into disjoint ranges, so each
+    output element is computed by one task, in a fixed order.
+  - Reductions use fixed-size chunks.
+  - So the thread count never changes a result. Set it with
+    `FLOCKML_THREADS`; it defaults to at most 8.
 
 ## Testing
 
-`dune test` runs 106 tests in five suites, which can also be run one at a
+`dune test` runs 246 tests in six suites, which can also be run one at a
 time:
 
 | Suite | Covers |
@@ -180,6 +223,7 @@ time:
 | `test_nn` | initialisation statistics, losses, layers, batching, metrics |
 | `test_optim` | SGD, momentum, weight decay and Adam against hand-computed updates |
 | `test_conv` | `im2col`/`col2im` adjointness, gradient checks of `im2col`, `max_pool2d` and a full conv layer, graph export |
+| `test_kernels` | every fast kernel against a plain reference on awkward shapes, gradient checks of the fused ops, gradient-buffer ownership, and bit-identical results at 1, 2, 3 and 8 threads |
 
 The central tool is the **gradient check** in `test/helpers.ml`. It compares
 every gradient that autograd computes against a central finite difference,
@@ -202,18 +246,49 @@ a gradient.
 
 ## Performance
 
-The matrix multiply uses an i-p-j loop order, so the innermost loop reads
-memory contiguously. Compare it against NumPy with:
+Making FlockML competitive in speed with mainstream CPU frameworks is the
+current goal: [ROADMAP.md](ROADMAP.md) has the plan, and
+[bench/RESULTS.md](bench/RESULTS.md) has the measured numbers for each phase.
+
+| | Before | 1 thread | 8 threads | Reference |
+|---|---|---|---|---|
+| MLP epoch | 16.6 s | 2.1 s | 0.57 s | PyTorch 0.51 s (1 thread) |
+| CNN epoch | 88 s | 14.5 s | 4.1 s | PyTorch 4.85 s (12 threads) |
+| 512² matmul | 1.8 GFLOP/s | 15 GFLOP/s | 106 GFLOP/s | NumPy 49 (1 thread), 142 (12) |
+
+The next step is an optional BLAS-backed tensor module, plugged in through
+the autograd functor.
+
+### Benchmarks
 
 ```sh
-dune exec --profile release bench/bench_matmul.exe
-python3 bench/numpy_baseline.py
+dune exec --profile release bench/bench_train.exe   # MLP and CNN epochs, per phase
+dune exec --profile release bench/bench_matmul.exe  # matmul on the shapes training uses
+dune exec --profile release bench/bench_ops.exe     # every other op, with allocation
+python3 bench/torch_baseline.py                     # the same models in PyTorch
+python3 bench/numpy_baseline.py                     # the same matmuls in NumPy
 ```
 
-FlockML sustains about 1.8 GFLOP/s on one core. NumPy reaches 20–100 GFLOP/s
-because it calls an optimised, multithreaded BLAS library. Cache blocking,
-SIMD-friendly inner loops, or a BLAS-backed tensor module plugged in through
-the functor are the natural next steps.
+`bench_train` splits each training step into data loading, forward pass,
+backward pass and optimizer update. It also reports heap allocation and GC
+collections per step, and accepts `--model mlp|cnn` and `--steps N` for quick
+runs. Every benchmark prints a Markdown table and measures wall-clock time.
+
+### Profiling
+
+Build in release mode, start a long run, and sample it:
+
+```sh
+dune build --profile release
+./_build/default/bench/bench_train.exe --model cnn &
+sample $! 10 -file profile.txt          # macOS; look under "Sort by top of stack"
+# Linux: perf record -g ./_build/default/bench/bench_train.exe --model cnn
+#        perf report
+```
+
+OCaml functions appear as `camlFlockml__Module.function_NNN`, for example
+`camlFlockml__Tensor.matmul_1304`. A lot of time in `caml_apply2` or
+`caml_alloc*` means closure calls or boxing in a hot loop.
 
 ## Layout
 
@@ -236,11 +311,12 @@ lib/
     mnist.ml(i)            IDX file loader (MNIST and Fashion-MNIST)
   metrics.ml(i)            accuracy, confusion matrix
   viz/graphviz.ml(i)       export a computational graph to DOT
+  parallel/parallel.ml(i)  domain pool: parallel_for over disjoint ranges
 bin/
   xor.ml                   smallest end-to-end example
   train_mnist.ml           MLP / CNN training CLI
 test/                      one OUnit2 suite per subsystem, plus the gradient checker
-bench/                     matmul benchmark vs NumPy
+bench/                     training, matmul and per-op benchmarks; PyTorch/NumPy baselines; RESULTS.md
 scripts/download_mnist.sh  dataset download
 ```
 

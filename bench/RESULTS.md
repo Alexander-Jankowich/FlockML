@@ -1,0 +1,238 @@
+# Benchmark results
+
+Each section is one dated run of the benchmark suite, one per roadmap phase
+(see [ROADMAP.md](../ROADMAP.md)). All runs use the release profile. To
+reproduce:
+
+```sh
+dune exec --profile release bench/bench_train.exe     # end-to-end epochs
+dune exec --profile release bench/bench_matmul.exe    # matmul shapes
+dune exec --profile release bench/bench_ops.exe       # everything else
+python3 bench/torch_baseline.py                       # PyTorch reference
+python3 bench/numpy_baseline.py                       # NumPy matmul reference
+OPENBLAS_NUM_THREADS=1 python3 bench/numpy_baseline.py  # ...on one thread
+```
+
+---
+
+## Phase 1 baseline (2026-11-26)
+
+**Machine:** Apple M2 Pro (12 cores), macOS. **FlockML:** OCaml 5.3.0, no
+flambda, single-threaded, float64. **References:** PyTorch 2.0.1, and
+NumPy 1.24.3 with OpenBLAS. MNIST, batch size 64, Adam (lr 1e-3).
+
+### Headline
+
+| Workload | FlockML | Reference (1 thread, f64) | Gap |
+|---|---|---|---|
+| MLP epoch | 16.56 s | PyTorch 0.51 s | 32× |
+| CNN epoch | 88.45 s | PyTorch 6.62 s | 13× |
+| 512² matmul | 1.82 GFLOP/s | NumPy 49.3 GFLOP/s (all threads: 142) | 27× (78×) |
+
+### Training, per step (ms, wall clock)
+
+| | data | fwd | bwd | optim | step | epoch s | MB alloc/step | minor GC/step | major GC/step |
+|---|---|---|---|---|---|---|---|---|---|
+| FlockML MLP | 0.126 | 7.528 | 7.812 | 2.189 | 17.655 | 16.56 | 23.17 | 9.25 | 0.010 |
+| PyTorch MLP f64 1T | 0.047 | 0.126 | 0.089 | 0.284 | 0.547 | 0.51 | | | |
+| PyTorch MLP f32 1T | 0.033 | 0.075 | 0.054 | 0.186 | 0.348 | 0.33 | | | |
+| FlockML CNN | 0.053 | 41.427 | 52.619 | 0.199 | 94.299 | 88.45 | 152.04 | 37.79 | 0.184 |
+| PyTorch CNN f64 1T | 0.083 | 3.123 | 3.665 | 0.186 | 7.057 | 6.62 | | | |
+| PyTorch CNN f64 12T | 0.096 | 1.783 | 2.965 | 0.331 | 5.175 | 4.85 | | | |
+| PyTorch CNN f32 1T | 0.039 | 2.457 | 4.253 | 0.096 | 6.845 | 6.42 | | | |
+
+Epoch times are per-step time × 938 steps. With 12 threads, PyTorch is
+*slower* on the MLP (0.74 s in f64) than with one thread: these matrices are
+too small to be worth splitting across cores. That is worth remembering for
+Phase 4.
+
+### Matmul (GFLOP/s)
+
+The FlockML backward rows (`a^T b`, `a b^T`) include the transposed copy that
+autograd makes today. NumPy's transposes are free views.
+
+| case | m×k×n | form | FlockML | NumPy 1T | NumPy 12T |
+|---|---|---|---|---|---|
+| square 64 | 64×64×64 | a b | 1.85 | 23.97 | 22.47 |
+| square 128 | 128×128×128 | a b | 1.83 | 39.48 | 59.88 |
+| square 256 | 256×256×256 | a b | 1.82 | 40.29 | 118.46 |
+| square 512 | 512×512×512 | a b | 1.82 | 49.30 | 142.41 |
+| mlp fc1 fwd | 64×784×128 | a b | 1.80 | 47.28 | 48.49 |
+| mlp fc1 dW | 784×64×128 | a^T b | 1.81 | 49.01 | 64.23 |
+| mlp fc2 fwd | 64×128×10 | a b | 1.88 | 24.73 | 24.13 |
+| mlp fc2 dW | 128×64×10 | a^T b | 1.66 | 24.13 | 24.13 |
+| mlp fc2 dX | 64×10×128 | a b^T | 1.78 | 29.56 | 30.01 |
+| cnn conv1 fwd | 50176×9×8 | a b | 1.80 | 14.03 | 20.10 |
+| cnn conv1 dW | 9×50176×8 | a^T b | 1.61 | 23.15 | 8.03 |
+| cnn conv2 fwd | 12544×72×16 | a b | 1.86 | 38.67 | 41.34 |
+| cnn conv2 dW | 72×12544×16 | a^T b | 1.71 | 41.47 | 18.06 |
+| cnn conv2 dcols | 12544×16×72 | a b^T | 1.79 | 29.55 | 21.37 |
+| cnn fc fwd | 64×784×10 | a b | 1.88 | 26.67 | 14.34 |
+
+### Other ops (FlockML)
+
+| op | µs/call | ns/elem | KB alloc/call |
+|---|---|---|---|
+| add [64;128] + [64;128] | 34.1 | 4.16 | 448.1 |
+| add [1M] + [1M] | 4455.1 | 4.46 | 54687.6 |
+| mul [1M] * [1M] | 4205.9 | 4.21 | 54687.6 |
+| scale [1M] | 3099.0 | 3.10 | 39062.6 |
+| exp [1M] | 9562.0 | 9.56 | 39062.6 |
+| relu fwd [1M] | 7905.0 | 7.91 | 23437.6 |
+| relu bwd [1M] | 7927.9 | 7.93 | 39062.6 |
+| bias add [64;128] + [128] | 118.0 | 14.41 | 448.7 |
+| bias add [50176;8] + [8] | 5757.1 | 14.34 | 21952.7 |
+| row sub [64;10] - [64;1] | 9.8 | 15.27 | 35.7 |
+| bias grad [64;128] → [128] | 53.2 | 6.49 | 129.6 |
+| bias grad [50176;8] → [8] | 2630.9 | 6.55 | 6272.7 |
+| broadcast_to [128] → [64;128] | 61.0 | 7.45 | 192.6 |
+| sum_axis [64;10] axis -1 | 3.8 | 5.96 | 30.7 |
+| max_axis [64;10] axis -1 | 3.1 | 4.84 | 20.7 |
+| sum_axis [64;128] axis 0 | 31.0 | 3.78 | 385.3 |
+| log_softmax [64;10] | 30.0 | 46.94 | 150.4 |
+| transpose [784;64] | 87.0 | 1.73 | 392.1 |
+| im2col [64;28;28;1] 3×3 | 4015.0 | 8.89 | 3528.2 |
+| im2col [64;14;14;8] 3×3 | 5268.1 | 5.83 | 7056.2 |
+| col2im → [64;14;14;8] 3×3 | 2579.0 | 2.86 | 784.2 |
+| max_pool2d [64;28;28;8] 2×2 | 2417.1 | 6.02 | 1568.1 |
+| max_pool2d [64;14;14;16] 2×2 | 1253.1 | 6.24 | 784.1 |
+| max_pool2d bwd [64;28;28;8] | 606.1 | 1.51 | 3136.2 |
+| max_pool2d bwd [64;14;14;16] | 237.0 | 1.18 | 1568.2 |
+| adam step (MLP, 101,770 params) | 2157.0 | 21.19 | 19083.8 |
+| sgd+momentum step (MLP) | 722.9 | 7.10 | 4771.1 |
+| take_rows 64 of [60000;784] | 18.1 | 0.36 | 392.2 |
+
+### What the numbers say
+
+- **Matmul runs at ~1.8 GFLOP/s whatever the shape.** It is limited by its
+  inner loop, not by cache behaviour, so register blocking and removing
+  bounds checks (Phase 2a) come before cache blocking. On one core NumPy is
+  8–27× faster across the shapes that training uses. The smallest gap is the
+  skinny conv1 forward pass (`k = 9`, `n = 8`), where NumPy's BLAS also
+  struggles.
+- **Elementwise ops allocate 3–7× their output size.** `add` on 1M floats
+  allocates 55 MB for an 8 MB result. Every value returned from the closure
+  passed to `Array.map`/`map2` is boxed, then copied. Direct loops (Phase 2b)
+  remove both the boxing and the indirect call.
+- **`relu` is ~2× slower than `add`.** `Float.max` handles NaN and signed
+  zero (the profile shows `caml_signbit` calls). A plain
+  `if x > 0. then x else 0.` is enough.
+- **Broadcasting costs ~3.5× a same-shape op** (14 vs 4 ns/elem) because of
+  the per-element `mod`/`div` in `source_offset`. The CNN's conv bias add
+  alone takes 5.8 ms per call; PyTorch's whole CNN forward pass takes 3.1 ms.
+- **Adam costs 7.7× PyTorch's update** (2.19 vs 0.28 ms per step) and
+  allocates 19 MB per step for 101,770 parameters, about 190 bytes per
+  parameter.
+- **The CNN step allocates 152 MB** and runs 38 minor collections per step.
+  The allocation work in Phases 2d and 3 should show up clearly here.
+- **Data loading doesn't matter yet** (0.13 ms out of 17.7 ms).
+
+---
+
+## Phases 2–4: single-core kernels, memory, multicore (2026-11-26)
+
+Same machine, compiler and references as the Phase 1 baseline. FlockML is
+still float64; "8T" means `FLOCKML_THREADS=8`, which is now the default here.
+PyTorch and NumPy numbers are the ones from Phase 1.
+
+### Headline
+
+| Workload | Phase 1 | FlockML 1T | FlockML 8T | PyTorch / NumPy 1T | PyTorch / NumPy all threads |
+|---|---|---|---|---|---|
+| MLP epoch | 16.56 s | 2.08 s | **0.57 s** | 0.51 s | 0.74 s (12T) |
+| CNN epoch | 88.45 s | 14.48 s | **4.10 s** | 6.62 s | 4.85 s (12T) |
+| 512² matmul | 1.82 GFLOP/s | 14.97 | **105.6** | 49.3 | 142 (12T) |
+
+Every Phase 2 and Phase 4 target in the roadmap is met. Test accuracy is
+unchanged: 97.29% for the MLP and 98.20% for the CNN after 3 epochs, the
+same as before to the hundredth of a percent.
+
+### Training, per step (ms, wall clock)
+
+| | data | fwd | bwd | optim | step | epoch s | MB alloc/step | minor GC/step | major GC/step |
+|---|---|---|---|---|---|---|---|---|---|
+| MLP, Phase 1 | 0.126 | 7.528 | 7.812 | 2.189 | 17.655 | 16.56 | 23.17 | 9.25 | 0.010 |
+| MLP 1T | 0.032 | 0.900 | 0.959 | 0.327 | 2.218 | 2.08 | 0.30 | 0.01 | 0.000 |
+| MLP 8T | 0.045 | 0.239 | 0.248 | 0.079 | 0.611 | 0.57 | 0.30 | 0.01 | 0.000 |
+| CNN, Phase 1 | 0.053 | 41.427 | 52.619 | 0.199 | 94.299 | 88.45 | 152.04 | 37.79 | 0.184 |
+| CNN 1T | 0.043 | 6.455 | 8.904 | 0.030 | 15.432 | 14.48 | 51.60 | 0.13 | 0.129 |
+| CNN 8T | 0.049 | 1.803 | 2.487 | 0.036 | 4.375 | 4.10 | 51.50 | 0.13 | 0.130 |
+
+### Scaling with threads (epoch seconds, 300 timed steps)
+
+| threads | 1 | 2 | 4 | 8 | 12 |
+|---|---|---|---|---|---|
+| MLP | 2.10 | 1.21 | 0.77 | 0.59 | 0.66 |
+| CNN | 14.61 | 8.53 | 5.66 | 4.24 | 4.64 |
+
+8 threads is fastest on this 8 performance + 4 efficiency core chip. The
+efficiency cores hold back the synchronous kernels, so the default thread
+count is capped at 8 (`FLOCKML_THREADS` overrides it).
+
+### Matmul (GFLOP/s)
+
+Backward rows now run `Tensor.gemm_` with `~trans_a`/`~trans_b`, as autograd
+does, so no transposed copy is included.
+
+| case | m×k×n | form | Phase 1 | FlockML 1T | FlockML 8T | NumPy 1T | NumPy 12T |
+|---|---|---|---|---|---|---|---|
+| square 64 | 64×64×64 | a b | 1.85 | 13.41 | 16.79 | 23.97 | 22.47 |
+| square 128 | 128×128×128 | a b | 1.83 | 14.66 | 55.15 | 39.48 | 59.88 |
+| square 256 | 256×256×256 | a b | 1.82 | 15.03 | 93.95 | 40.29 | 118.46 |
+| square 512 | 512×512×512 | a b | 1.82 | 14.97 | 105.64 | 49.30 | 142.41 |
+| mlp fc1 fwd | 64×784×128 | a b | 1.80 | 15.00 | 73.80 | 47.28 | 48.49 |
+| mlp fc1 dW | 784×64×128 | a^T b | 1.81 | 14.43 | 79.35 | 49.01 | 64.23 |
+| mlp fc2 fwd | 64×128×10 | a b | 1.88 | 9.04 | 7.81 | 24.73 | 24.13 |
+| mlp fc2 dW | 128×64×10 | a^T b | 1.66 | 9.54 | 7.81 | 24.13 | 24.13 |
+| mlp fc2 dX | 64×10×128 | a b^T | 1.78 | 10.91 | 9.04 | 29.56 | 30.01 |
+| cnn conv1 fwd | 50176×9×8 | a b | 1.80 | 7.80 | 25.53 | 14.03 | 20.10 |
+| cnn conv1 dW | 9×50176×8 | a^T b | 1.61 | 6.21 | 38.65 | 23.15 | 8.03 |
+| cnn conv2 fwd | 12544×72×16 | a b | 1.86 | 12.24 | 63.50 | 38.67 | 41.34 |
+| cnn conv2 dW | 72×12544×16 | a^T b | 1.71 | 12.16 | 59.45 | 41.47 | 18.06 |
+| cnn conv2 dcols | 12544×16×72 | a b^T | 1.79 | 11.74 | 52.94 | 29.55 | 21.37 |
+| cnn fc fwd | 64×784×10 | a b | 1.88 | 9.11 | 18.96 | 26.67 | 14.34 |
+
+### Other ops (µs per call)
+
+| op | Phase 1 | 1T | 8T | KB alloc/call (Phase 1 → now) |
+|---|---|---|---|---|
+| add [1M] + [1M] | 4455.1 | 1205.9 | 186.0 | 54688 → 7813 |
+| exp [1M] | 9562.0 | 6274.9 | 860.9 | 39063 → 7813 |
+| relu fwd [1M] | 7905.0 | 738.9 | 144.0 | 23438 → 7813 |
+| relu bwd [1M] | 7927.9 | 968.0 | 176.9 | 39063 → 7813 |
+| bias add [50176;8] + [8] | 5757.1 | 799.9 | 138.0 | 21953 → 3137 |
+| bias grad [50176;8] → [8] | 2630.9 | 244.1 | 67.9 | 6273 → 3 |
+| broadcast_to [8] → [50176;8] | – | 427.0 | 82.0 | 3137 |
+| log_softmax [64;10] | 30.0 | 4.1 | 4.1 | 150 → 5 |
+| im2col [64;28;28;1] 3×3 | 4015.0 | 751.0 | 271.1 | 3528 → 3539 |
+| im2col [64;14;14;8] 3×3 | 5268.1 | 1194.0 | 269.2 | 7056 → 7067 |
+| col2im → [64;14;14;8] 3×3 | 2579.0 | 718.1 | 143.1 | 784 → 795 |
+| max_pool2d [64;28;28;8] 2×2 | 2417.1 | 620.1 | 155.0 | 1568 → 1568 |
+| max_pool2d bwd [64;28;28;8] | 606.1 | 459.0 | 305.9 | 3136 → 3136 |
+| adam step (MLP, 101,770 params) | 2157.0 | 325.9 | 76.1 | 19084 → 1 |
+| sgd+momentum step (MLP) | 722.9 | 162.1 | 52.9 | 4771 → 1 |
+
+(The Phase 1 relu rows timed the closure-based `Tensor.map` that autograd
+used at the time. The new rows time `Tensor.relu` / `Tensor.relu_backward`,
+which replaced it.)
+
+### What the numbers say
+
+- **Single-core matmul is 8× faster** (1.8 → 15 GFLOP/s). The 4×4
+  register-blocked kernel keeps 16 accumulators in registers, and on arm64
+  `ocamlopt` compiles each `c +. a *. b` to one fused multiply-add. NumPy's
+  BLAS is still 3× faster per core, because it uses SIMD (two doubles per
+  instruction) and a larger kernel, which OCaml can't express.
+- **On 8 threads, matmul beats NumPy on the MLP's own shapes** (74–79
+  against 48–64 GFLOP/s), and reaches 106 GFLOP/s at 512².
+- **The MLP is now at PyTorch's speed**, and the CNN beats PyTorch's
+  12-thread time on 8 threads. Per step, the MLP spends 0.08 ms in Adam
+  (PyTorch: 0.28 ms) and 0.49 ms in forward and backward (PyTorch: 0.22 ms).
+- **Allocation is down 77×** for the MLP (23 → 0.3 MB per step) and 3× for
+  the CNN. Minor collections went from 9–38 per step to almost none. What
+  the CNN still allocates is the tensors themselves (im2col matrices,
+  activations, gradients). Each op returns a fresh tensor, which is
+  inherent to the define-by-run design.
+- **Small matmuls don't benefit from threads** (`fc2`, 64×128×10). They
+  stay below the parallel threshold, which is right: PyTorch's own 12-thread
+  MLP is slower than its 1-thread MLP for the same reason.

@@ -78,36 +78,24 @@ let set_lr opt lr =
 (* ------------------------------------------------------------------------ *)
 
 (** One SGD update of every parameter that has a gradient, in place:
-    - weight decay: [g <- g + weight_decay * p] (on a copy, never the stored
-      gradient);
-    - plain: [p <- p - lr * g];
-    - with momentum: [v <- momentum * v + g], then [p <- p - lr * v]. *)
+    - weight decay: [g' = g + weight_decay * p] (the stored gradient itself
+      is never changed);
+    - plain: [p <- p - lr * g'];
+    - with momentum: [v <- momentum * v + g'], then [p <- p - lr * v].
+
+    Each parameter is updated by one fused pass ({!Tensor.sgd_update_}),
+    which reads every tensor once and allocates nothing. *)
 let sgd_step params (s : sgd) =
   Array.iteri
     (fun i param ->
       match Var.grad param with
       | None -> () (* not used in this loss: leave it alone *)
-      | Some g ->
-          (* [p] is the parameter's actual storage, so mutating it updates
-             the model; no new Var is created. *)
-          let p = Var.value param in
-          (* Weight decay = gradient of (wd/2)·||p||². Build a NEW tensor
-             rather than mutating [g], which is still the param's grad. *)
-          let g =
-            if s.weight_decay > 0. then
-              Tensor.add g (Tensor.scale s.weight_decay p)
-            else g
-          in
-          if s.momentum = 0. then
-            (* p <- p - lr * g *)
-            Tensor.axpy_ ~alpha:(-.s.lr) ~x:g ~y:p
-          else begin
-            (* v <- momentum * v + g;  p <- p - lr * v *)
-            let v = s.velocity.(i) in
-            Tensor.scale_ s.momentum v;
-            Tensor.add_ v g;
-            Tensor.axpy_ ~alpha:(-.s.lr) ~x:v ~y:p
-          end)
+      | Some grad ->
+          (* [Var.value param] is the parameter's actual storage, so
+             mutating it updates the model; no new Var is created. *)
+          Tensor.sgd_update_ ~lr:s.lr ~momentum:s.momentum
+            ~weight_decay:s.weight_decay ~param:(Var.value param) ~grad
+            ~velocity:s.velocity.(i))
     params
 
 (** One Adam update of every parameter that has a gradient, in place:
@@ -121,7 +109,11 @@ let sgd_step params (s : sgd) =
     v}
     Weight decay is applied to [g] first, as in SGD. On the first step
     [m_hat / sqrt v_hat = sign g], so every parameter moves by almost exactly
-    [lr]. *)
+    [lr].
+
+    Each parameter is updated by one fused pass ({!Tensor.adam_update_}). It
+    does the same arithmetic as the step-by-step formulas above, with no
+    temporary tensors (equal up to the last bit of rounding). *)
 let adam_step params (a : adam) =
   (* One tick per optimizer step, shared by every parameter. *)
   a.t <- a.t + 1;
@@ -134,29 +126,10 @@ let adam_step params (a : adam) =
     (fun i param ->
       match Var.grad param with
       | None -> ()
-      | Some g ->
-          let p = Var.value param in
-          (* Weight decay = gradient of (wd/2)·||p||². Build a NEW tensor
-             rather than mutating [g], which is still the param's grad. *)
-          let g =
-            if a.weight_decay > 0. then
-              Tensor.add g (Tensor.scale a.weight_decay p)
-            else g
-          in
-          let m = a.m.(i) and v = a.v.(i) in
-          (* m <- beta1 * m + (1 - beta1) * g      (running mean of g) *)
-          Tensor.scale_ a.beta1 m;
-          Tensor.axpy_ ~alpha:(1. -. a.beta1) ~x:g ~y:m;
-          (* v <- beta2 * v + (1 - beta2) * g^2    (running mean of g^2) *)
-          Tensor.scale_ a.beta2 v;
-          Tensor.axpy_ ~alpha:(1. -. a.beta2) ~x:(Tensor.mul g g) ~y:v;
-          (* p <- p - lr * m_hat / (sqrt v_hat + eps), elementwise *)
-          let update =
-            Tensor.map2
-              (fun mi vi -> mi /. bc1 /. (Float.sqrt (vi /. bc2) +. a.eps))
-              m v
-          in
-          Tensor.axpy_ ~alpha:(-.a.lr) ~x:update ~y:p)
+      | Some grad ->
+          Tensor.adam_update_ ~lr:a.lr ~beta1:a.beta1 ~beta2:a.beta2
+            ~eps:a.eps ~weight_decay:a.weight_decay ~bc1 ~bc2
+            ~param:(Var.value param) ~grad ~m:a.m.(i) ~v:a.v.(i))
     params
 
 let step opt =

@@ -127,6 +127,15 @@ module type S = sig
   val sqrt : t -> t
   (** Elementwise square root. *)
 
+  val relu : t -> t
+  (** Elementwise [max x 0]. A NaN input stays NaN; [-infinity] gives NaN
+      (the kernel is branch-free, so it multiplies by a 0/1 mask). *)
+
+  val relu_backward : input:t -> grad:t -> t
+  (** The gradient of {!relu}: [grad] where [input > 0], else 0, computed as
+      [grad * mask] (so a NaN or infinite [grad] gives NaN where
+      [input <= 0]). Shapes must match exactly. *)
+
   (** {1 Broadcasting} *)
 
   val broadcast_shapes : int array -> int array -> int array
@@ -171,6 +180,21 @@ module type S = sig
   val matmul : t -> t -> t
   (** 2-D matrix product: [[| m; k |]] x [[| k; n |]] -> [[| m; n |]]. *)
 
+  val gemm_ :
+    ?trans_a:bool -> ?trans_b:bool -> ?alpha:float -> ?beta:float -> t -> t ->
+    c:t -> unit
+  (** General matrix multiply, in place:
+      [c <- alpha * op(a) op(b) + beta * c], where [op(x)] is [x] transposed
+      if the matching [trans_] flag is set. Defaults: no transposes,
+      [alpha = 1], [beta = 0]. With [beta = 0], [c]'s previous contents are
+      ignored. Transposes are never materialised. [c] must be 2-D with the
+      result's shape and must not share storage with [a] or [b]; otherwise
+      raises [Invalid_argument].
+
+      Autograd uses it to compute [g · bᵀ] and [aᵀ · g] for the matmul
+      backward pass, and to accumulate straight into an existing gradient
+      ([beta = 1]). *)
+
   val transpose : t -> t
   (** 2-D transpose. *)
 
@@ -182,8 +206,38 @@ module type S = sig
   val take_rows : t -> int array -> t
   (** [take_rows t idx] selects slices along axis 0 (used for mini-batches). *)
 
+  val take_rows_ : t -> int array -> dst:t -> unit
+  (** [take_rows_ t idx ~dst] is {!take_rows} written into an existing
+      tensor, whose shape must be [t]'s with axis 0 set to
+      [Array.length idx]. Lets a training loop reuse one batch buffer. *)
+
   val one_hot : num_classes:int -> int array -> t
   (** [[| n |]] labels -> [[| n; num_classes |]] matrix of 0s and 1s. *)
+
+  (** {1 Softmax and cross-entropy (along the last axis)} *)
+
+  val log_softmax : t -> t
+  (** Numerically stable [x - max - log (sum (exp (x - max)))] along the last
+      axis, one fused pass per row. *)
+
+  val log_softmax_backward : output:t -> grad:t -> t
+  (** The gradient of {!log_softmax}, given its [output]:
+      [grad - exp output * sum_row grad]. *)
+
+  val softmax_cross_entropy : t -> int array -> float * t
+  (** [softmax_cross_entropy logits labels], for [[| batch; classes |]]
+      logits and one label per row: the mean negative log-likelihood of the
+      labels, together with [log_softmax logits], which the backward pass
+      needs. Raises [Invalid_argument] on a label out of range or a length
+      mismatch. *)
+
+  val softmax_cross_entropy_backward :
+    log_probs:t -> labels:int array -> scale:float -> t
+  (** [scale * (one_hot labels - exp log_probs)], computed per element as
+      [y * scale - softmax * scale]. With [scale = -g / batch], where [g] is
+      the upstream gradient of the loss, this is the gradient of
+      {!softmax_cross_entropy} with respect to the logits:
+      [g * (softmax - one_hot) / batch]. *)
 
   (** {1 In-place (mutating) operations, used by optimizers} *)
 
@@ -201,6 +255,38 @@ module type S = sig
 
   val blit_ : src:t -> dst:t -> unit
   (** Copy [src]'s data into [dst]. Shapes must match. *)
+
+  val adam_update_ :
+    lr:float ->
+    beta1:float ->
+    beta2:float ->
+    eps:float ->
+    weight_decay:float ->
+    bc1:float ->
+    bc2:float ->
+    param:t ->
+    grad:t ->
+    m:t ->
+    v:t ->
+    unit
+  (** One Adam step for one parameter, as a single fused pass with no
+      temporaries: [g' = g + weight_decay * p],
+      [m <- beta1 * m + (1 - beta1) g'], [v <- beta2 * v + (1 - beta2) g'²],
+      [p <- p - lr * (m / bc1) / (sqrt (v / bc2) + eps)]. [bc1] and [bc2]
+      are the bias corrections [1 - beta^t]. All four tensors must have the
+      same shape. *)
+
+  val sgd_update_ :
+    lr:float ->
+    momentum:float ->
+    weight_decay:float ->
+    param:t ->
+    grad:t ->
+    velocity:t ->
+    unit
+  (** One SGD step for one parameter, in one pass:
+      [g' = g + weight_decay * p]; then [p <- p - lr * g'] if [momentum = 0],
+      or [v <- momentum * v + g'; p <- p - lr * v]. *)
 
   (** {1 Convolution helpers} *)
 

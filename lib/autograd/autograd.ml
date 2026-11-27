@@ -33,6 +33,7 @@ struct
     | Exp of t
     | Log of t
     | Matmul of t * t
+    | Linear of t * t * t  (** [x], [w], [b] of [x · w + b] *)
     | Transpose of t
     | Reshape of t
     | Sum of t
@@ -42,6 +43,11 @@ struct
     | Sigmoid of t
     | Tanh of t
     | Log_softmax of t
+    | Softmax_cross_entropy of {
+        logits : t;
+        labels : int array;
+        log_probs : tensor;  (** [log_softmax logits], kept for backward *)
+      }
     | Im2col of { input : t; kh : int; kw : int; stride : int; padding : int }
     | Max_pool2d of { input : t; argmax : int array }
         (** [argmax] holds the flat input index that won each output window *)
@@ -51,6 +57,15 @@ struct
     id : int;  (** unique, increasing: handy for hashing and for graphviz *)
     value : tensor;  (** the result of the forward computation *)
     mutable grad : tensor option;  (** filled in by [backward] *)
+    mutable grad_owned : bool;
+        (** whether [grad] is a buffer this node may update in place. A
+            gradient handed over from another node (e.g. passed straight
+            through an [Add]) is shared, and must be copied before it is
+            changed. *)
+    mutable spare : tensor option;
+        (** the gradient buffer from before the last [zero_grad], reused by
+            the next backward pass instead of allocating a new one *)
+    mutable mark : int;  (** the [topo_sort] pass that last visited it *)
     requires_grad : bool;  (** whether gradients should flow to this node *)
     op : op;  (** how this node was produced *)
   }
@@ -60,28 +75,46 @@ struct
   (* ---------------------------------------------------------------------- *)
 
   (** The last id handed out by {!fresh_id}. *)
-  let next_id = ref 0
+  let next_id = Atomic.make 0
 
   (** A new id, larger than every id handed out before it. *)
-  let fresh_id () =
-    incr next_id;
-    !next_id
+  let fresh_id () = Atomic.fetch_and_add next_id 1 + 1
 
-  (** A node with no inputs: a constant or a parameter. *)
-  let leaf value ~requires_grad =
-    { id = fresh_id (); value; grad = None; requires_grad; op = Leaf }
+  (** False inside {!no_grad}: new nodes then record no inputs. *)
+  let recording = Domain.DLS.new_key (fun () -> ref true)
 
-  (** [node value op inputs] wraps the result of an operation. An interior node
-      requires a gradient iff any of its inputs does; that is what lets
-      [backward] skip whole subgraphs built only from constants. *)
-  let node value op inputs =
+  let make value ~requires_grad op =
     {
       id = fresh_id ();
       value;
       grad = None;
-      requires_grad = List.exists (fun p -> p.requires_grad) inputs;
+      grad_owned = false;
+      spare = None;
+      mark = 0;
+      requires_grad;
       op;
     }
+
+  (** A node with no inputs: a constant or a parameter. *)
+  let leaf value ~requires_grad = make value ~requires_grad Leaf
+
+  (** [node value op inputs] wraps the result of an operation. An interior node
+      requires a gradient iff any of its inputs does; that is what lets
+      [backward] skip whole subgraphs built only from constants. Under
+      {!no_grad} the result is a plain constant, so the inputs (and the whole
+      graph behind them) are not kept alive. *)
+  let node value op inputs =
+    if not !(Domain.DLS.get recording) then leaf value ~requires_grad:false
+    else
+      make value
+        ~requires_grad:(List.exists (fun p -> p.requires_grad) inputs)
+        op
+
+  let no_grad f =
+    let r = Domain.DLS.get recording in
+    let saved = !r in
+    r := false;
+    Fun.protect ~finally:(fun () -> r := saved) f
 
   let const value = leaf value ~requires_grad:false
   let param value = leaf value ~requires_grad:true
@@ -98,7 +131,12 @@ struct
 
   let requires_grad v = v.requires_grad
   let id v = v.id
-  let zero_grad v = v.grad <- None
+
+  let zero_grad v =
+    (match v.grad with Some g when v.grad_owned -> v.spare <- Some g | _ -> ());
+    v.grad <- None;
+    v.grad_owned <- false
+
   let detach v = const v.value
 
   let parents v =
@@ -106,6 +144,7 @@ struct
     | Leaf -> []
     | Add (a, b) | Sub (a, b) | Mul (a, b) | Div (a, b) | Matmul (a, b) ->
         [ a; b ]
+    | Linear (x, w, b) -> [ x; w; b ]
     | Neg a
     | Scale (_, a)
     | Pow (a, _)
@@ -120,6 +159,7 @@ struct
     | Sigmoid a
     | Tanh a
     | Log_softmax a
+    | Softmax_cross_entropy { logits = a; _ }
     | Im2col { input = a; _ }
     | Max_pool2d { input = a; _ } ->
         [ a ]
@@ -137,6 +177,7 @@ struct
     | Exp _ -> "exp"
     | Log _ -> "log"
     | Matmul _ -> "matmul"
+    | Linear _ -> "linear"
     | Transpose _ -> "transpose"
     | Reshape _ -> "reshape"
     | Sum _ -> "sum"
@@ -146,6 +187,7 @@ struct
     | Sigmoid _ -> "sigmoid"
     | Tanh _ -> "tanh"
     | Log_softmax _ -> "log_softmax"
+    | Softmax_cross_entropy _ -> "softmax_cross_entropy"
     | Im2col _ -> "im2col"
     | Max_pool2d _ -> "max_pool2d"
 
@@ -165,6 +207,20 @@ struct
   let exp a = node (T.exp a.value) (Exp a) [ a ]
   let log a = node (T.log a.value) (Log a) [ a ]
   let matmul a b = node (T.matmul a.value b.value) (Matmul (a, b)) [ a; b ]
+
+  (** The output starts as [b] broadcast to [[| m; n |]], and the product is
+      accumulated straight into it ([beta = 1]), so the bias add costs no
+      separate pass and no extra tensor. *)
+  let linear x w b =
+    let xs = T.shape x.value and ws = T.shape w.value in
+    if Array.length xs <> 2 || Array.length ws <> 2 || xs.(1) <> ws.(0) then
+      invalid_arg
+        (Printf.sprintf "Var.linear: cannot multiply [%d dims] by [%d dims]"
+           (Array.length xs) (Array.length ws));
+    let out = T.broadcast_to b.value [| xs.(0); ws.(1) |] in
+    T.gemm_ ~beta:1.0 x.value w.value ~c:out;
+    node out (Linear (x, w, b)) [ x; w; b ]
+
   let transpose a = node (T.transpose a.value) (Transpose a) [ a ]
   let reshape a new_shape = node (T.reshape a.value new_shape) (Reshape a) [ a ]
   let sum a = node (T.sum a.value) (Sum a) [ a ]
@@ -176,7 +232,7 @@ struct
     let axis = if axis < 0 then axis + T.ndim a.value else axis in
     node (T.sum_axis ~keepdims a.value axis) (Sum_axis (a, axis)) [ a ]
 
-  let relu a = node (T.map (fun x -> Float.max x 0.0) a.value) (Relu a) [ a ]
+  let relu a = node (T.relu a.value) (Relu a) [ a ]
 
   (** [1 / (1 + e^-x)] for [x >= 0] and the equivalent [e^x / (1 + e^x)] for
       [x < 0], so the exponential never overflows. *)
@@ -192,18 +248,17 @@ struct
   let tanh a = node (T.map Float.tanh a.value) (Tanh a) [ a ]
 
   (** Computed stably as [x - m - log (sum (exp (x - m)))], where [m] is the
-      row maximum, so the largest exponent is [e^0]. The whole formula is
-      tensor-level work producing a single node: one closed-form backward rule
-      is faster and more stable than differentiating a chain of Var ops. *)
-  let log_softmax a =
-    let x = a.value in
-    let m = T.max_axis ~keepdims:true x (-1) in
-    (* [B; 1] row maxima *)
-    let shifted = T.sub x m in
-    (* [B; C] largest entry per row is 0 *)
-    let lse = T.log (T.sum_axis ~keepdims:true (T.exp shifted) (-1)) in
-    (* [B; 1] *)
-    node (T.sub shifted lse) (Log_softmax a) [ a ]
+      row maximum, so the largest exponent is [e^0]. The backend does it in a
+      single fused pass, producing a single node: one closed-form backward
+      rule is faster and more stable than differentiating a chain of Var
+      ops. *)
+  let log_softmax a = node (T.log_softmax a.value) (Log_softmax a) [ a ]
+
+  let softmax_cross_entropy logits labels =
+    let loss, log_probs = T.softmax_cross_entropy logits.value labels in
+    node (T.scalar loss)
+      (Softmax_cross_entropy { logits; labels = Array.copy labels; log_probs })
+      [ logits ]
 
   (** The convolution parameters are recorded in the op so the backward pass
       can scatter gradients back with [col2im]. *)
@@ -223,13 +278,50 @@ struct
   (* Backward pass                                                           *)
   (* ---------------------------------------------------------------------- *)
 
-  (** [accumulate v g] adds [g] into [v.grad] (if [v] requires a gradient).
-      Gradients accumulate because a node used in several places receives a
-      contribution from each use (multivariate chain rule): for [y = x * x],
-      [dy/dx = x + x]. *)
-  let accumulate v g =
+  (** [accumulate ~owned v g] adds [g] into [v.grad] (if [v] requires a
+      gradient). Gradients accumulate because a node used in several places
+      receives a contribution from each use (multivariate chain rule): for
+      [y = x * x], [dy/dx = x + x].
+
+      [owned] says whether [g] was freshly computed for [v] alone. Then [v]
+      may keep it and later add into it in place. A shared [g] (one that is
+      also another node's gradient) is stored as is, but copied before
+      anything is added to it. *)
+  let accumulate ?(owned = true) v g =
     if v.requires_grad then
-      v.grad <- Some (match v.grad with None -> g | Some g0 -> T.add g0 g)
+      match v.grad with
+      | None ->
+          v.grad <- Some g;
+          v.grad_owned <- owned
+      | Some g0 when v.grad_owned -> T.add_ g0 g
+      | Some g0 ->
+          v.grad <- Some (T.add g0 g);
+          v.grad_owned <- true
+
+  (** A buffer that the gradient of [v] can be written into directly, plus
+      the [beta] to write it with: [0] for a buffer whose contents don't
+      matter yet (the [spare] from before [zero_grad], or a fresh one), [1]
+      to add onto an existing gradient. Lets [gemm_] produce weight
+      gradients with no temporary matrix. *)
+  let grad_buffer v =
+    match v.grad with
+    | Some g when v.grad_owned -> (g, 1.0)
+    | Some g ->
+        let g = T.copy g in
+        v.grad <- Some g;
+        v.grad_owned <- true;
+        (g, 1.0)
+    | None ->
+        let shape = T.shape v.value in
+        let buf =
+          match v.spare with
+          | Some s when T.shape s = shape -> s
+          | _ -> T.zeros shape
+        in
+        v.spare <- None;
+        v.grad <- Some buf;
+        v.grad_owned <- true;
+        (buf, 0.0)
 
   (** [propagate v g] applies one step of the chain rule: given the gradient
       [g] of the loss with respect to [v] (same shape as [v.value]), it adds
@@ -247,16 +339,37 @@ struct
     let acc_bcast x f =
       acc x (fun () -> T.sum_to_shape (f ()) (T.shape x.value))
     in
+    (* Gradient [g] passed through unchanged: shared unless it needs
+       reducing to a broadcast input's shape. Once shared, [v] gives up the
+       right to update [g] in place (a later backward call would otherwise
+       change [x]'s gradient behind its back), so its next accumulation
+       copies first. *)
+    let pass_through x =
+      if x.requires_grad then
+        let xs = T.shape x.value in
+        if xs = T.shape g then begin
+          accumulate ~owned:false x g;
+          v.grad_owned <- false
+        end
+        else accumulate x (T.sum_to_shape g xs)
+    in
+    (* da += alpha * op(p) op(q), written straight into a's gradient. *)
+    let gemm_into x ?trans_a ?trans_b p q =
+      if x.requires_grad then begin
+        let dst, beta = grad_buffer x in
+        T.gemm_ ?trans_a ?trans_b ~beta p q ~c:dst
+      end
+    in
     let out = v.value in
     match v.op with
     | Leaf -> ()
+    (* Add: da = g, db = g *)
     | Add (a, b) ->
-        (* Add: da = g, db = g *)
-        accumulate a (T.sum_to_shape g (T.shape a.value));
-        accumulate b (T.sum_to_shape g (T.shape b.value))
+        pass_through a;
+        pass_through b
     (* Sub: da = g, db = -g *)
     | Sub (a, b) ->
-        acc_bcast a (fun () -> g);
+        pass_through a;
         acc_bcast b (fun () -> T.neg g)
     (* Mul: da = g * b, db = g * a  (each input gets the OTHER one) *)
     | Mul (a, b) ->
@@ -279,10 +392,17 @@ struct
     | Log a -> acc a (fun () -> T.div g a.value)
     (* Matmul (out = a @ b), [m;k] x [k;n] -> [m;n]:
          da = g @ transpose b   : [m;n] x [n;k] -> [m;k]
-         db = transpose a @ g   : [k;m] x [m;n] -> [k;n] *)
+         db = transpose a @ g   : [k;m] x [m;n] -> [k;n]
+       gemm_ reads the transposes in place and adds into the gradients. *)
     | Matmul (a, b) ->
-        acc a (fun () -> T.matmul g (T.transpose b.value));
-        acc b (fun () -> T.matmul (T.transpose a.value) g)
+        gemm_into a ~trans_b:true g b.value;
+        gemm_into b ~trans_a:true a.value g
+    (* Linear (out = x @ w + b): as Matmul for x and w; the bias gradient
+       sums g over the batch rows. *)
+    | Linear (x, w, b) ->
+        gemm_into x ~trans_b:true g w.value;
+        gemm_into w ~trans_a:true x.value g;
+        acc b (fun () -> T.sum_to_shape g (T.shape b.value))
     (* Transpose: da = transpose g *)
     | Transpose a -> acc a (fun () -> T.transpose g)
     (* Reshape: da = reshape g (shape of a) *)
@@ -304,9 +424,7 @@ struct
             kept.(axis) <- 1;
             T.broadcast_to (T.reshape g kept) a_shape)
     (* Relu: da = g where a > 0, else 0 *)
-    | Relu a ->
-        acc a (fun () ->
-            T.map2 (fun x gi -> if x > 0. then gi else 0.) a.value g)
+    | Relu a -> acc a (fun () -> T.relu_backward ~input:a.value ~grad:g)
     (* Sigmoid: da = g * out * (1 - out) *)
     | Sigmoid a ->
         acc a (fun () -> T.mul g (T.map (fun s -> s *. (1. -. s)) out))
@@ -316,9 +434,14 @@ struct
          softmax = exp out
          da = g - softmax * sum_axis ~keepdims:true g (-1) *)
     | Log_softmax a ->
-        acc a (fun () ->
-            let softmax = T.exp out in
-            T.sub g (T.mul softmax (T.sum_axis ~keepdims:true g (-1))))
+        acc a (fun () -> T.log_softmax_backward ~output:out ~grad:g)
+    (* Softmax cross-entropy (loss = -mean of the labels' log-probabilities):
+         d logits = g * (softmax - one_hot) / batch *)
+    | Softmax_cross_entropy { logits; labels; log_probs } ->
+        acc logits (fun () ->
+            let batch = float_of_int (Array.length labels) in
+            T.softmax_cross_entropy_backward ~log_probs ~labels
+              ~scale:(-1. /. batch *. T.item g))
     (* Im2col: scatter-add the column gradients back to the input. *)
     | Im2col { input; kh; kw; stride; padding } ->
         acc input (fun () ->
@@ -330,17 +453,22 @@ struct
             T.max_pool2d_backward ~grad_out:g ~argmax
               ~input_shape:(T.shape input.value))
 
+  (** Distinguishes one [topo_sort] from the next, so marking a node visited
+      is one integer store rather than a hash-table insertion. *)
+  let pass = Atomic.make 0
+
   (** Every node reachable from [root] that requires a gradient, in topological
-      order: each node appears after all of its parents. A post-order DFS with
-      a table of visited ids; it does not descend into nodes that need no
-      gradient, since nothing below them does either. The recursion is as deep
-      as the graph, which is fine for MLPs and CNNs. *)
+      order: each node appears after all of its parents. A post-order DFS that
+      marks visited nodes with the current pass number; it does not descend
+      into nodes that need no gradient, since nothing below them does either.
+      The recursion is as deep as the graph, which is fine for MLPs and
+      CNNs. *)
   let topo_sort root =
-    let seen = Hashtbl.create 64 in
+    let p = Atomic.fetch_and_add pass 1 + 1 in
     let order = ref [] in
     let rec visit v =
-      if v.requires_grad && not (Hashtbl.mem seen v.id) then begin
-        Hashtbl.add seen v.id ();
+      if v.requires_grad && v.mark <> p then begin
+        v.mark <- p;
         List.iter visit (parents v);
         order := v :: !order
       end

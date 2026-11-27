@@ -63,7 +63,8 @@ let sequential layers = Sequential layers
 
 (** One pattern match over the layer type. Every case is built from Var ops,
     so no layer needs backward code of its own.
-    - [Linear]: [x @ w + b], with [b] broadcast over the batch.
+    - [Linear]: [x @ w + b], with [b] broadcast over the batch, as one fused
+      {!Var.linear} node.
     - [Conv2d]: im2col turns each output pixel's receptive field into a row,
       one matmul applies every filter to every patch, and a reshape restores
       NHWC.
@@ -71,7 +72,7 @@ let sequential layers = Sequential layers
     - [Sequential]: a left fold, passing [train] and [rng] down. *)
 let rec forward ?(train = false) ?rng layer x =
   match layer with
-  | Linear r -> Var.add (Var.matmul x r.w) r.b
+  | Linear r -> Var.linear x r.w r.b
   | Conv2d r ->
       (* x : [n; h; w; in_c]   r.w : [kernel*kernel*in_c; out_c]   r.b : [out_c] *)
       let s = Var.shape x in
@@ -86,7 +87,7 @@ let rec forward ?(train = false) ?rng layer x =
           ~padding:r.padding
       in
       (* Every filter applied to every patch at once: [n*oh*ow; out_c] *)
-      let out = Var.add (Var.matmul cols r.w) r.b in
+      let out = Var.linear cols r.w r.b in
       Var.reshape out [| n; oh; ow; out_c |]
   | Max_pool2d r -> Var.max_pool2d x ~size:r.size ~stride:r.stride
   | Relu -> Var.relu x

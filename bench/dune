@@ -1,3 +1,7 @@
-(executable
- (name bench_matmul)
+; Benchmarks. Always build and run them with --profile release:
+;   dune exec --profile release bench/bench_train.exe
+; Bench_util is shared by all three executables.
+
+(executables
+ (names bench_matmul bench_ops bench_train)
  (libraries flockml unix))
