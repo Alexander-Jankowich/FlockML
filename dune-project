@@ -17,9 +17,10 @@
  (name flockml)
  (synopsis "A small PyTorch-like neural network library written from scratch in OCaml")
  (description
-  "Tensors, reverse-mode automatic differentiation, layers, losses, optimizers (SGD, Adam) and an MNIST training pipeline, built without external numerical libraries.")
+  "Tensors, reverse-mode automatic differentiation, layers, losses, optimizers (SGD, Adam) and an MNIST training pipeline, built without external numerical libraries. The optional flockml.blas library adds a Bigarray backend with BLAS (Accelerate or OpenBLAS), in float64 or float32.")
  (depends
   (ocaml
    (>= 5.0))
   dune
-  (ounit2 :with-test)))
+  (ounit2 :with-test))
+ (depopts dune-configurator))

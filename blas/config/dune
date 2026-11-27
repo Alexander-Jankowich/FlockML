@@ -1,0 +1,13 @@
+; Decides how flockml.blas reaches a BLAS library, and writes the C flags
+; and link flags that blas/dune includes. When dune-configurator is not
+; installed, the simpler discover.plain.ml is used instead, so the build
+; never needs it.
+
+(executable
+ (name discover)
+ (libraries
+  (select
+   discover.ml
+   from
+   (dune-configurator -> discover.configurator.ml)
+   (-> discover.plain.ml))))

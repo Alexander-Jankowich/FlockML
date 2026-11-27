@@ -4,4 +4,4 @@
 
 (executables
  (names bench_matmul bench_ops bench_train)
- (libraries flockml unix))
+ (libraries flockml flockml.blas unix))

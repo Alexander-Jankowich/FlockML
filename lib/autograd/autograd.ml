@@ -12,6 +12,24 @@
     nodes, so the implementation writes [Float.exp] / [T.exp] explicitly for
     floats / tensors. *)
 
+(* State shared by every instance of the functor. With several backends in
+   one program (say the default one and a BLAS one), node ids stay unique
+   across all of them, and {!Autograd_intf.S.no_grad} switches recording off
+   for all of them at once. *)
+
+(** The last node id handed out by {!fresh_id}. *)
+let next_id = Atomic.make 0
+
+(** A new id, larger than every id handed out before it. *)
+let fresh_id () = Atomic.fetch_and_add next_id 1 + 1
+
+(** False inside [no_grad]: new nodes then record no inputs. *)
+let recording = Domain.DLS.new_key (fun () -> ref true)
+
+(** Distinguishes one [topo_sort] from the next, so marking a node visited
+    is one integer store rather than a hash-table insertion. *)
+let pass = Atomic.make 0
+
 (** [Make (T)] builds an autograd engine whose node values and gradients are
     tensors of backend [T]. *)
 module Make (T : Tensor_intf.S) : Autograd_intf.S with type tensor = T.t =
@@ -73,15 +91,6 @@ struct
   (* ---------------------------------------------------------------------- *)
   (* Node construction and inspection                                        *)
   (* ---------------------------------------------------------------------- *)
-
-  (** The last id handed out by {!fresh_id}. *)
-  let next_id = Atomic.make 0
-
-  (** A new id, larger than every id handed out before it. *)
-  let fresh_id () = Atomic.fetch_and_add next_id 1 + 1
-
-  (** False inside {!no_grad}: new nodes then record no inputs. *)
-  let recording = Domain.DLS.new_key (fun () -> ref true)
 
   let make value ~requires_grad op =
     {
@@ -452,10 +461,6 @@ struct
         acc input (fun () ->
             T.max_pool2d_backward ~grad_out:g ~argmax
               ~input_shape:(T.shape input.value))
-
-  (** Distinguishes one [topo_sort] from the next, so marking a node visited
-      is one integer store rather than a hash-table insertion. *)
-  let pass = Atomic.make 0
 
   (** Every node reachable from [root] that requires a gradient, in topological
       order: each node appears after all of its parents. A post-order DFS that

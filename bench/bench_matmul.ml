@@ -2,7 +2,10 @@
     actually multiplies, to compare against NumPy (bench/numpy_baseline.py,
     which uses the same shape list). Always run in release mode:
 
-    {v dune exec --profile release bench/bench_matmul.exe v}
+    {v
+    dune exec --profile release bench/bench_matmul.exe
+    dune exec --profile release bench/bench_matmul.exe -- --backend blas
+    v}
 
     The backward-pass rows time the computation as autograd performs it:
     [Tensor.gemm_] with [~trans_a] / [~trans_b], which reads the transposed
@@ -42,7 +45,8 @@ let cases =
       { name = "cnn fc fwd"; m = 64; k = 784; n = 10; form = `NN };
     ]
 
-let run rng c =
+let run (module B : Flockml.S) rng c =
+  let open B in
   let a_shape, b_shape =
     match c.form with
     | `NN -> ([| c.m; c.k |], [| c.k; c.n |])
@@ -66,10 +70,21 @@ let run rng c =
     (flops /. r.secs /. 1e9)
 
 let () =
+  Arg.parse
+    (Arg.align
+       [
+         backend_arg;
+         ( "--threads",
+           Arg.Int Parallel.set_num_threads,
+           " Threads for the tensor kernels (default: FLOCKML_THREADS, or up \
+            to 8)" );
+       ])
+    (fun _ -> ())
+    "bench_matmul [options]";
   Printf.printf "FlockML matmul, %s\n\n" (environment ());
   Printf.printf "| %-20s | %17s | %s | %10s | %8s |\n" "case" "mxkxn" "form "
     "ms/call" "GFLOP/s";
   Printf.printf "|%s|%s|%s|%s|%s|\n" (String.make 22 '-') (String.make 19 '-')
     "-------" (String.make 12 '-') (String.make 10 '-');
   let rng = Random.State.make [| 0 |] in
-  List.iter (run rng) cases
+  List.iter (run (backend ()) rng) cases

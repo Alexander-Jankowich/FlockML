@@ -1,0 +1,23 @@
+; flockml.blas: the optional Bigarray + BLAS backend. It is a separate
+; library, so the core flockml library keeps no dependencies. config/discover
+; picks the BLAS (Accelerate on macOS, OpenBLAS or another CBLAS elsewhere)
+; and falls back to portable C when there is none, so this always builds.
+
+(library
+ (name tensor_blas)
+ (public_name flockml.blas)
+ (libraries flockml)
+ (foreign_stubs
+  (language c)
+  (names tensor_blas_stubs)
+  (flags
+   (:standard -O3 -fno-wrapv -std=c11 (:include c_flags.sexp))))
+ (c_library_flags
+  (:include c_library_flags.sexp)))
+
+(rule
+ (targets c_flags.sexp c_library_flags.sexp)
+ (deps
+  (env_var FLOCKML_BLAS))
+ (action
+  (run config/discover.exe)))

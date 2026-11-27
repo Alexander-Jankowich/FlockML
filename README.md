@@ -3,17 +3,25 @@
 A small PyTorch-like neural network library written from scratch in OCaml.
 It provides n-dimensional tensors, reverse-mode automatic differentiation,
 layers, losses, SGD and Adam optimizers, and a complete MNIST training
-pipeline. It uses no numerical libraries, only the OCaml standard library.
+pipeline. The core uses no numerical libraries, only the OCaml standard
+library. An optional second backend, `flockml.blas`, runs the same code on
+Bigarrays with BLAS, in float64 or float32.
 
 On MNIST, a two-layer MLP reaches **97.3%** test accuracy after 3 epochs, and a
-small CNN reaches **98.2%**. Training is about as fast as PyTorch on the same
-CPU: an MLP epoch takes 0.57 s and a CNN epoch 4.1 s on 8 threads of an
-Apple M2 Pro.
+small CNN reaches **98.2%**. On 8 threads of an Apple M2 Pro:
+- The pure-OCaml backend trains about as fast as PyTorch on the same CPU: an
+  MLP epoch takes 0.57 s and a CNN epoch 4.1 s.
+- The BLAS backend is faster than PyTorch: 0.21 s and 3.1 s in float64,
+  0.12 s and 2.3 s in float32.
 
 ## Quick start
 
 Requirements: OCaml 5.0 or later, dune, and ounit2 for the tests
-(`opam install dune ounit2`).
+(`opam install dune ounit2`). The optional BLAS backend needs nothing extra
+on macOS, where it uses Accelerate. On Linux, install OpenBLAS (e.g.
+`libopenblas-dev`) and `opam install dune-configurator` to use it.
+Without them, the BLAS backend still builds, with a slower portable C matrix
+multiply.
 
 ```sh
 dune build                         # compile everything
@@ -24,6 +32,7 @@ dune exec bin/xor.exe              # a tiny MLP learns XOR in under a second
 ./scripts/download_mnist.sh        # fetch MNIST into data/mnist (~55 MB)
 dune exec --profile release bin/train_mnist.exe -- --epochs 3
 dune exec --profile release bin/train_mnist.exe -- --model cnn
+dune exec --profile release bin/train_mnist.exe -- --backend blas32
 ```
 
 Use `--profile release` for anything performance-sensitive: it turns on
@@ -57,6 +66,17 @@ let () =
 updates the parameters in place. This is the whole of `bin/xor.ml`, apart from
 logging.
 
+The same code runs on the BLAS backend: build the stack for it with
+`Flockml.Make`, and open that instead of `Flockml`:
+
+```ocaml
+module B = Flockml.Make (Tensor_blas.F32)   (* or Tensor_blas.F64 *)
+open B
+(* ... exactly the code above ... *)
+```
+
+This needs `flockml.blas` in the `libraries` of your dune file.
+
 ## What's included
 
 | Module | Contents |
@@ -72,8 +92,12 @@ logging.
 | `Metrics` | Argmax predictions, accuracy, confusion matrices |
 | `Graphviz` | Export any computation graph to DOT for visualisation |
 | `Parallel` | A small pool of OCaml 5 domains that the tensor kernels use for data parallelism |
+| `Make`, `S`, `Default` | `Flockml.Make (T)` builds all of the above for a tensor backend `T`. The top-level modules are `Default = Make (Tensor)` |
+| `Layout` | Shape and broadcasting arithmetic shared by the backends |
+| `Tensor_blas` (`flockml.blas`) | The optional backend: `F64` and `F32` tensors on Bigarrays, matmul through BLAS (Accelerate or OpenBLAS), every other kernel in vectorised C |
 
-Every public function is documented in its interface (`.mli` or `*_intf.ml`).
+Every public function is documented in its interface: an `.mli`, an
+`*_intf.ml`, or the `module type S` at the top of each functor's file.
 Run `dune build @doc` to generate HTML documentation in
 `_build/default/_doc/_html`.
 
@@ -82,15 +106,18 @@ Run `dune build @doc` to generate HTML documentation in
 Measured on an Apple M2 Pro, release profile, with Adam at learning rate
 1e-3 and batch size 64:
 
-| Model | Data | Parameters | Test accuracy | Epoch, 8 threads | Epoch, 1 thread |
-|---|---|---|---|---|---|
-| MLP 784–128–10 | MNIST, 3 epochs | 101,770 | 97.29% | 0.57 s | 2.1 s |
-| CNN (2 × conv/pool, linear) | MNIST, 3 epochs | 9,098 | 98.20% | 4.1 s | 14.5 s |
+| Model | Data | Parameters | Test accuracy | Epoch, 8 threads | Epoch, 1 thread | BLAS f64 | BLAS f32 |
+|---|---|---|---|---|---|---|---|
+| MLP 784–128–10 | MNIST, 3 epochs | 101,770 | 97.29% | 0.57 s | 2.1 s | 0.21 s | 0.12 s |
+| CNN (2 × conv/pool, linear) | MNIST, 3 epochs | 9,098 | 98.20% | 4.1 s | 14.5 s | 3.1 s | 2.3 s |
 
-Times are wall clock, for training only. The results don't depend on the
-thread count: every kernel gives bit-identical output however many threads
-run it. [bench/RESULTS.md](bench/RESULTS.md) has the per-phase breakdown and
-the PyTorch comparison.
+Times are wall clock, for training only. The BLAS columns use 8 threads with
+Accelerate. That backend reaches the same accuracy in float64 (to the
+hundredth of a percent at every epoch), and within 0.05% in float32. The
+results don't depend on the thread count: every kernel gives bit-identical
+output however many threads run it.
+[bench/RESULTS.md](bench/RESULTS.md) has the per-phase breakdown and the
+PyTorch comparison.
 
 The CNN reaches a higher accuracy with less than a tenth of the MLP's
 parameters, because each convolution filter is shared across the whole image.
@@ -112,6 +139,8 @@ are mistaken for which. For the MLP run above, the most common mistakes were
 --data-dir DIR      location of the IDX files (default data/mnist)
 --threads N         threads for the tensor kernels (default: FLOCKML_THREADS,
                     or the recommended domain count capped at 8)
+--backend B         ocaml (pure OCaml, float64; the default), blas
+                    (Tensor_blas.F64) or blas32 (Tensor_blas.F32)
 ```
 
 For Fashion-MNIST, run `./scripts/download_mnist.sh fashion` and pass
@@ -159,10 +188,27 @@ only primitives that convolutional networks add to the engine.
 
 ### Backends are swappable through a functor
 
-Autograd is a functor, `Autograd.Make (T : Tensor_intf.S)`, over a tensor
-signature; `Var` is simply `Autograd.Make (Tensor)`. Any other backend that
-implements `Tensor_intf.S`, such as one using Bigarray, BLAS or a GPU, gets
-the autograd engine, layers and optimizers unchanged.
+Everything above the tensors is written against one signature,
+`Tensor_intf.S`. `Flockml.Make (T)` builds the whole stack for a backend `T`:
+`Var = Autograd.Make (T)`, then `Layer`, `Loss`, `Optim`, `Dataset` and the
+rest over it. The modules you get from `open Flockml` are simply
+`Make (Tensor)`.
+
+The optional `flockml.blas` library (in `blas/`) is a second backend:
+- `Tensor_blas.F64` and `Tensor_blas.F32` store tensors in Bigarrays.
+- `gemm_` calls `cblas_dgemm` / `cblas_sgemm`, from Accelerate on macOS or
+  OpenBLAS (or another CBLAS) on Linux. On Apple silicon, Accelerate runs
+  matrix products on the AMX matrix units, at 660 GFLOP/s in float64 and
+  2.2 TFLOP/s in float32.
+- Every other kernel is C, written once for both precisions, vectorised by
+  the compiler and split across domains with `Parallel`.
+- Tensor memory is recycled through a pool, so a training step reuses the
+  previous step's buffers.
+- A build step finds the BLAS. With none installed, it falls back to a
+  portable C matrix multiply, so the library always builds. Set
+  `FLOCKML_BLAS=accelerate|openblas|none` while building to force a choice.
+
+The core library doesn't depend on it.
 
 ### Design choices
 
@@ -213,8 +259,9 @@ The interfaces stay simple; the speed comes from how the kernels in
 
 ## Testing
 
-`dune test` runs 246 tests in six suites, which can also be run one at a
-time:
+`dune test` runs 669 tests in seven executables, which can also be run one at
+a time. The suites themselves are functors over a backend (`test/suites/`),
+so the same tests run on both backends:
 
 | Suite | Covers |
 |---|---|
@@ -224,8 +271,9 @@ time:
 | `test_optim` | SGD, momentum, weight decay and Adam against hand-computed updates |
 | `test_conv` | `im2col`/`col2im` adjointness, gradient checks of `im2col`, `max_pool2d` and a full conv layer, graph export |
 | `test_kernels` | every fast kernel against a plain reference on awkward shapes, gradient checks of the fused ops, gradient-buffer ownership, and bit-identical results at 1, 2, 3 and 8 threads |
+| `test_backends` | all six suites again on `Tensor_blas.F64`, then every op and a few MLP and CNN training steps on both backends, checked to agree (to 1e-11 in float64, 1e-5 in float32) |
 
-The central tool is the **gradient check** in `test/helpers.ml`. It compares
+The central tool is the **gradient check** in `test/suites/helpers.ml`. It compares
 every gradient that autograd computes against a central finite difference,
 `(f(x + ε) − f(x − ε)) / 2ε`, so any mistake in a backward rule shows up as a
 specific input element with the wrong value.
@@ -250,14 +298,14 @@ Making FlockML competitive in speed with mainstream CPU frameworks is the
 current goal: [ROADMAP.md](ROADMAP.md) has the plan, and
 [bench/RESULTS.md](bench/RESULTS.md) has the measured numbers for each phase.
 
-| | Before | 1 thread | 8 threads | Reference |
-|---|---|---|---|---|
-| MLP epoch | 16.6 s | 2.1 s | 0.57 s | PyTorch 0.51 s (1 thread) |
-| CNN epoch | 88 s | 14.5 s | 4.1 s | PyTorch 4.85 s (12 threads) |
-| 512² matmul | 1.8 GFLOP/s | 15 GFLOP/s | 106 GFLOP/s | NumPy 49 (1 thread), 142 (12) |
+| | Before | 1 thread | 8 threads | BLAS f64 | BLAS f32 | Reference |
+|---|---|---|---|---|---|---|
+| MLP epoch | 16.6 s | 2.1 s | 0.57 s | 0.21 s | 0.12 s | PyTorch 0.51 s (f64), 0.34 s (f32) |
+| CNN epoch | 88 s | 14.5 s | 4.1 s | 3.1 s | 2.3 s | PyTorch 4.30 s (f64, 12 threads) |
+| 512² matmul | 1.8 GFLOP/s | 15 GFLOP/s | 106 GFLOP/s | 660 GFLOP/s | 2234 GFLOP/s | NumPy 50 (1 thread), 144 (12) |
 
-The next step is an optional BLAS-backed tensor module, plugged in through
-the autograd functor.
+The first three columns are the pure-OCaml backend. Phases 1–5 of the
+roadmap are done; Phase 6 (graph replay, fusion, GPU) is next.
 
 ### Benchmarks
 
@@ -269,8 +317,9 @@ python3 bench/torch_baseline.py                     # the same models in PyTorch
 python3 bench/numpy_baseline.py                     # the same matmuls in NumPy
 ```
 
-`bench_train` splits each training step into data loading, forward pass,
-backward pass and optimizer update. It also reports heap allocation and GC
+Every benchmark takes `--backend ocaml|blas|blas32`. `bench_train` splits
+each training step into data loading, forward pass, backward pass and
+optimizer update. It also reports heap allocation and GC
 collections per step, and accepts `--model mlp|cnn` and `--steps N` for quick
 runs. Every benchmark prints a Markdown table and measures wall-clock time.
 
@@ -294,31 +343,43 @@ OCaml functions appear as `camlFlockml__Module.function_NNN`, for example
 
 ```
 lib/
+  flockml.ml               the library's entry: Make (T), module type S, Default
   tensor/
     tensor_intf.ml         module type S: what a numerical backend must provide
     tensor.ml(i)           default backend: row-major float array + shape
+    layout.ml(i)           shape and broadcasting arithmetic, shared by backends
   autograd/
     autograd_intf.ml       module type S: the autograd engine's interface
     autograd.ml            Make (T : Tensor_intf.S): graph ADT + backward pass
-    var.ml                 Var = Autograd.Make (Tensor), used everywhere else
   nn/
-    init.ml(i)             Xavier / He initialisation
-    layer.ml(i)            layers as an ADT (Linear, Conv2d, Relu, Sequential...)
-    loss.ml(i)             MSE, cross-entropy, binary cross-entropy
-  optim/optim.ml(i)        SGD (+momentum, weight decay), Adam
+    init.ml                Xavier / He initialisation
+    layer.ml               layers as an ADT (Linear, Conv2d, Relu, Sequential...)
+    loss.ml                MSE, cross-entropy, binary cross-entropy
+  optim/optim.ml           SGD (+momentum, weight decay), Adam
   data/
-    dataset.ml(i)          in-memory dataset, shuffling, lazy mini-batches
-    mnist.ml(i)            IDX file loader (MNIST and Fashion-MNIST)
-  metrics.ml(i)            accuracy, confusion matrix
-  viz/graphviz.ml(i)       export a computational graph to DOT
+    dataset.ml             in-memory dataset, shuffling, lazy mini-batches
+    mnist.ml               IDX file loader (MNIST and Fashion-MNIST)
+  metrics.ml               accuracy, confusion matrix
+  viz/graphviz.ml          export a computational graph to DOT
   parallel/parallel.ml(i)  domain pool: parallel_for over disjoint ranges
+blas/                      flockml.blas, the optional backend
+  tensor_blas.ml(i)        Tensor_blas.F64 / F32: Bigarray storage, shape checks
+  tensor_blas_stubs.c      C stubs: CBLAS gemm, the tensor memory pool
+  kernels.h                the C kernels, written once for float and double
+  config/                  finds the BLAS at build time
 bin/
   xor.ml                   smallest end-to-end example
   train_mnist.ml           MLP / CNN training CLI
-test/                      one OUnit2 suite per subsystem, plus the gradient checker
+test/
+  suites/                  one OUnit2 suite per subsystem, as a functor over a backend
+  test_*.ml                runs each suite on the default backend
+  test_backends.ml         every suite on the BLAS backend, and cross-backend agreement
 bench/                     training, matmul and per-op benchmarks; PyTorch/NumPy baselines; RESULTS.md
 scripts/download_mnist.sh  dataset download
 ```
+
+Each module in `nn/`, `optim/`, `data/`, `metrics.ml` and `viz/` is a
+functor, with its documented signature `S` in the same file.
 
 ## License
 

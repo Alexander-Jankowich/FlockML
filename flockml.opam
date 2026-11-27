@@ -3,7 +3,7 @@ opam-version: "2.0"
 synopsis:
   "A small PyTorch-like neural network library written from scratch in OCaml"
 description:
-  "Tensors, reverse-mode automatic differentiation, layers, losses, optimizers (SGD, Adam) and an MNIST training pipeline, built without external numerical libraries."
+  "Tensors, reverse-mode automatic differentiation, layers, losses, optimizers (SGD, Adam) and an MNIST training pipeline, built without external numerical libraries. The optional flockml.blas library adds a Bigarray backend with BLAS (Accelerate or OpenBLAS), in float64 or float32."
 maintainer: ["Alexander Jankowich"]
 authors: ["Alexander Jankowich"]
 license: "MIT"
@@ -15,6 +15,7 @@ depends: [
   "ounit2" {with-test}
   "odoc" {with-doc}
 ]
+depopts: ["dune-configurator"]
 build: [
   ["dune" "subst"] {dev}
   [

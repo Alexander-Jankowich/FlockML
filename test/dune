@@ -1,7 +1,17 @@
 ; One executable per subsystem, so each can be run on its own:
 ;   dune exec test/test_tensor.exe
-; `dune test` runs them all.
+; `dune test` runs them all. The tests themselves are in suites/, as functors
+; over a backend: test_<subsystem> runs one suite on the default backend, and
+; test_backends runs all of them on the BLAS backend (flockml.blas), plus
+; checks that the backends agree.
 
 (tests
- (names test_tensor test_autograd test_nn test_optim test_conv test_kernels)
- (libraries flockml ounit2))
+ (names
+  test_tensor
+  test_autograd
+  test_nn
+  test_optim
+  test_conv
+  test_kernels
+  test_backends)
+ (libraries flockml flockml.blas flockml_tests ounit2))

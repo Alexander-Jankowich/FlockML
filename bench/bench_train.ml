@@ -6,6 +6,7 @@
     {v
     dune exec --profile release bench/bench_train.exe
     dune exec --profile release bench/bench_train.exe -- --model cnn --steps 200
+    dune exec --profile release bench/bench_train.exe -- --backend blas32
     v}
 
     By default every model trains for one full epoch (938 steps at batch size
@@ -43,6 +44,7 @@ let spec =
     ( "--no-reuse",
       Arg.Clear reuse,
       " Allocate every batch afresh instead of reusing one buffer" );
+    backend_arg;
     ( "--data-dir",
       Arg.Set_string data_dir,
       " Location of the IDX files; random data is used if they are missing" );
@@ -58,7 +60,9 @@ type totals = {
 }
 (** Per-phase wall-clock totals, in seconds. *)
 
-let run kind =
+let run (module B : Flockml.S) kind =
+  let open B in
+  let open Models (B) in
   let rng = Random.State.make [| 42 |] in
   let train, source = load_train ~data_dir:!data_dir ~flatten:(kind = `Mlp) in
   let n = Dataset.length train in
@@ -143,7 +147,7 @@ let () =
        (List.map
           (fun w -> String.make (w + 2) '-')
           [ 14; 5; 7; 7; 7; 7; 7; 8; 8; 6; 6 ]));
-  let results = List.map run !models in
+  let results = List.map (run (backend ())) !models in
   let source, steps_per_epoch = List.hd results in
   Printf.printf
     "\n\

@@ -13,6 +13,9 @@ python3 bench/numpy_baseline.py                       # NumPy matmul reference
 OPENBLAS_NUM_THREADS=1 python3 bench/numpy_baseline.py  # ...on one thread
 ```
 
+Every FlockML benchmark takes `--backend ocaml|blas|blas32` (Phase 5): the
+pure-OCaml backend (the default), or `Tensor_blas.F64` / `F32`.
+
 ---
 
 ## Phase 1 baseline (2026-11-26)
@@ -236,3 +239,143 @@ which replaced it.)
 - **Small matmuls don't benefit from threads** (`fc2`, 64×128×10). They
   stay below the parallel threshold, which is right: PyTorch's own 12-thread
   MLP is slower than its 1-thread MLP for the same reason.
+
+---
+
+## Phase 5: the BLAS backend (2026-11-26)
+
+Same machine and compiler. The new backend is `flockml.blas`
+(`Tensor_blas.F64` / `F32`), run through `Flockml.Make`: Bigarray storage,
+`cblas_dgemm` / `cblas_sgemm` from Apple's **Accelerate**, and every other
+kernel in C compiled with `-O3`. Select it in any benchmark with
+`--backend blas` (float64) or `--backend blas32` (float32). PyTorch and
+NumPy were re-run in this session: PyTorch's CNN on 12 threads measured
+4.30 s this time, against 4.85 s in Phase 1.
+
+### Headline
+
+| Workload | Pure OCaml, 8T | BLAS f64, 8T | BLAS f32, 8T | Best PyTorch / NumPy, f64 | Best PyTorch, f32 |
+|---|---|---|---|---|---|
+| MLP epoch | 0.57 s | **0.21 s** | **0.12 s** | 0.51 s (1T) | 0.34 s (1T) |
+| CNN epoch | 4.18 s | **3.14 s** | **2.27 s** | 4.30 s (12T) | 6.40 s (1T) |
+| 512² matmul | 107 GFLOP/s | **660** | **2234** | NumPy 144 (12T) | |
+
+Every Phase 5 target is met. Matmul is 4.6× NumPy's 12-thread speed, against
+a target of "within 1.5×". The MLP is 2.4× and the CNN 1.4× faster than the
+fastest PyTorch configuration in float64, against a target of "within 2×".
+Much of the matmul gain is hardware: Accelerate runs matrix products on the
+M2's AMX matrix units, and NumPy's OpenBLAS doesn't use them.
+
+Test accuracy after 3 epochs:
+
+| | Pure OCaml | BLAS f64 | BLAS f32 |
+|---|---|---|---|
+| MLP | 97.29% | 97.29% | 97.25% |
+| CNN | 98.20% | 98.20% | 98.17% |
+
+In float64 the BLAS backend matches the pure one at every epoch, to the
+hundredth of a percent.
+
+### Training, per step (ms, wall clock)
+
+| | data | fwd | bwd | optim | step | epoch s | MB alloc/step | minor GC/step | major GC/step |
+|---|---|---|---|---|---|---|---|---|---|
+| MLP, pure 8T | 0.050 | 0.235 | 0.243 | 0.079 | 0.606 | 0.57 | 0.30 | 0.01 | 0.000 |
+| MLP, BLAS f64 1T | 0.036 | 0.056 | 0.054 | 0.093 | 0.239 | 0.22 | 0.01 | 0.01 | 0.000 |
+| MLP, BLAS f64 8T | 0.040 | 0.068 | 0.059 | 0.058 | 0.224 | 0.21 | 0.01 | 0.01 | 0.000 |
+| MLP, BLAS f32 8T | 0.026 | 0.032 | 0.024 | 0.045 | 0.127 | 0.12 | 0.01 | 0.01 | 0.000 |
+| PyTorch MLP f64 1T | 0.046 | 0.122 | 0.098 | 0.276 | 0.543 | 0.51 | | | |
+| PyTorch MLP f32 1T | 0.033 | 0.068 | 0.067 | 0.192 | 0.361 | 0.34 | | | |
+| CNN, pure 8T | 0.046 | 1.839 | 2.537 | 0.035 | 4.457 | 4.18 | 51.50 | 0.13 | 0.130 |
+| CNN, BLAS f64 1T | 0.040 | 2.097 | 1.789 | 0.009 | 3.936 | 3.69 | 1.23 | 0.63 | 0.626 |
+| CNN, BLAS f64 8T | 0.049 | 1.541 | 1.749 | 0.013 | 3.352 | 3.14 | 1.24 | 0.67 | 0.666 |
+| CNN, BLAS f32 8T | 0.033 | 1.363 | 1.014 | 0.007 | 2.416 | 2.27 | 1.24 | 0.33 | 0.334 |
+| PyTorch CNN f64 12T | 0.072 | 1.636 | 2.601 | 0.270 | 4.580 | 4.30 | | | |
+| PyTorch CNN f32 1T | 0.049 | 2.456 | 4.224 | 0.097 | 6.827 | 6.40 | | | |
+
+"1T" for the BLAS backend means `FLOCKML_THREADS=1 VECLIB_MAXIMUM_THREADS=1`:
+one thread for FlockML's kernels and one for Accelerate. "MB alloc/step"
+counts the OCaml heap only. The BLAS backend's tensor data lives outside the
+heap, in recycled buffers (see below), so the column no longer measures
+tensor allocation for it.
+
+### Matmul (GFLOP/s)
+
+| case | m×k×n | form | pure 8T | BLAS f64 | BLAS f64 1T | BLAS f32 | NumPy 1T | NumPy 12T |
+|---|---|---|---|---|---|---|---|---|
+| square 64 | 64×64×64 | a b | 16.4 | 244 | 244 | 550 | 22.6 | 22.2 |
+| square 128 | 128×128×128 | a b | 55.2 | 298 | 279 | 838 | 38.6 | 58.5 |
+| square 256 | 256×256×256 | a b | 93.5 | 347 | 349 | 1154 | 39.7 | 118.2 |
+| square 512 | 512×512×512 | a b | 107.3 | 660 | 344 | 2234 | 50.4 | 144.3 |
+| mlp fc1 fwd | 64×784×128 | a b | 73.9 | 299 | 285 | 980 | 47.2 | 48.5 |
+| mlp fc1 dW | 784×64×128 | a^T b | 78.8 | 306 | 306 | 1078 | 49.0 | 63.7 |
+| mlp fc2 fwd | 64×128×10 | a b | 8.2 | 76 | 76 | 137 | 24.1 | 23.3 |
+| mlp fc2 dW | 128×64×10 | a^T b | 7.8 | 86 | 86 | 172 | 23.6 | 23.4 |
+| mlp fc2 dX | 64×10×128 | a b^T | 9.2 | 76 | 76 | 172 | 29.1 | 29.1 |
+| cnn conv1 fwd | 50176×9×8 | a b | 25.7 | 41.6 | 41.7 | 26.1 | 13.6 | 19.8 |
+| cnn conv1 dW | 9×50176×8 | a^T b | 38.7 | 90.2 | 87.1 | 95.3 | 23.2 | 8.2 |
+| cnn conv2 fwd | 12544×72×16 | a b | 63.5 | 176 | 174 | 295 | 38.8 | 39.3 |
+| cnn conv2 dW | 72×12544×16 | a^T b | 59.3 | 175 | 177 | 603 | 41.5 | 17.2 |
+| cnn conv2 dcols | 12544×16×72 | a b^T | 52.9 | 138 | 138 | 196 | 29.5 | 4.0 |
+| cnn fc fwd | 64×784×10 | a b | 19.0 | 91.5 | 91.5 | 168 | 26.7 | 14.2 |
+
+The small `fc2` products take a few microseconds, close to the timer's
+resolution, so their rows are only rough.
+
+### Other ops (µs per call, 8 threads)
+
+| op | pure | BLAS f64 | BLAS f32 |
+|---|---|---|---|
+| add [1M] + [1M] | 186.0 | 124.0 | 60.1 |
+| exp [1M] | 860.0 | 817.1 | 227.9 |
+| relu fwd [1M] | 143.1 | 93.9 | 60.1 |
+| relu bwd [1M] | 173.1 | 124.0 | 60.1 |
+| bias add [50176;8] + [8] | 140.9 | 58.2 | 53.9 |
+| bias grad [50176;8] → [8] | 68.2 | 57.0 | 57.9 |
+| broadcast_to [8] → [50176;8] | 82.0 | 57.0 | 52.0 |
+| log_softmax [64;10] | 4.1 | 3.1 | 1.9 |
+| transpose [784;64] | 40.1 | 32.9 | 27.9 |
+| im2col [64;28;28;1] 3×3 | 186.9 | 174.0 | 167.1 |
+| im2col [64;14;14;8] 3×3 | 266.1 | 182.9 | 113.0 |
+| col2im → [64;14;14;8] 3×3 | 146.9 | 93.0 | 75.1 |
+| max_pool2d [64;28;28;8] 2×2 | 151.2 | 227.9 | 226.0 |
+| max_pool2d bwd [64;28;28;8] | 137.1 | 104.0 | 75.1 |
+| adam step (MLP, 101,770 params) | 74.1 | 48.2 | 37.9 |
+| sgd+momentum step (MLP) | 50.1 | 41.0 | 31.0 |
+| take_rows 64 of [60000;784] | 21.0 | 7.2 | 4.1 |
+
+### What the numbers say
+
+- **Matmul is no longer the bottleneck anywhere.** It ran at 15 GFLOP/s
+  per core in pure OCaml, and Accelerate runs it at 250–660 GFLOP/s in
+  float64 and up to 2.2 TFLOP/s in float32. The MLP step is now dominated
+  by the elementwise ops and Adam.
+- **The C kernels are memory-bound, and float32 halves the bytes.** With
+  8 threads, `add` on 1M elements moves 24 MB in 124 µs (about
+  190 GB/s, near the chip's bandwidth). In float32 it takes 60 µs.
+- **Off-heap storage needed its own allocator.** The first version
+  allocated each tensor with `Bigarray.Array1.create`, and its CNN epoch was
+  *slower* than pure OCaml's (5.9 s against 4.6 s), with 7 major GC cycles
+  per step. Two things combined:
+  - The OCaml runtime charges Bigarray memory to the *major* GC, in
+    proportion to the OCaml heap. With the dataset in a Bigarray, that heap
+    is tiny, so every few megabytes of activations forced a full cycle.
+  - Without those cycles, garbage piled up (6 GB resident set), and fresh
+    `malloc` memory page-faulted on first touch.
+
+  Tensors now come from a recycling pool (`fb_create` in the C stubs). A
+  freed buffer goes back on a free list for its size, so the next step
+  reuses memory that is already mapped. Tensors are charged to the *minor*
+  GC (`caml_alloc_custom` with a fixed 128 MB budget), which finalises the
+  dead temporaries of a step cheaply. Major cycles went from 7 per CNN step
+  to 0.67, and the epoch from 5.9 s to 3.1 s.
+- **In-place ops were on the scalar path.** The compiler vectorises
+  `o[i] = a[i] + b[i]` only after checking at run time that `o` and `a`
+  don't overlap. In `add_` and `scale_` they are the same array, so the
+  check failed and the loop ran scalar, 1.5× slower than the allocating op.
+  The kernels now have a separate in-place loop.
+- **The CNN gains less than the MLP**, because its time is spread over
+  im2col, pooling, broadcasts and reshapes, which are memory-bound in both
+  backends. `max_pool2d` is the one op that got slower. It still returns its
+  winning indices as an OCaml `int array` (6.4 MB per call), and allocating
+  that on a small heap costs more than the kernel itself.

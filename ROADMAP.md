@@ -8,18 +8,19 @@ without giving up the readable, from-scratch core.
 
 ## Where we are
 
-**Phases 1–4 are done (2026-11-26).** On the same machine, single-threaded,
-an MLP epoch went from 16.56 s to 2.08 s and a CNN epoch from 88.45 s to
-14.48 s. On 8 threads they take 0.57 s and 4.10 s, against PyTorch's 0.51 s
-(1 thread) and 4.85 s (12 threads). Test accuracy is unchanged. Phase 5
-(the optional BLAS backend) is next. Full tables:
+**Phases 1–5 are done (2026-11-26).** The pure-OCaml backend went from a
+16.56 s MLP epoch and an 88.45 s CNN epoch (Phase 1) to 0.57 s and 4.10 s on
+8 threads (Phase 4). The optional BLAS backend (Phase 5) brings them to
+0.21 s and 3.14 s in float64, and 0.12 s and 2.27 s in float32. On the
+same machine, PyTorch's best is 0.51 s and 4.30 s in float64. Test accuracy
+is unchanged. Phase 6 (stretch goals) is next. Full tables:
 [bench/RESULTS.md](bench/RESULTS.md).
 
-| Workload | Phase 1 | Now, 1 thread | Now, 8 threads | Reference |
-|---|---|---|---|---|
-| 512×512 matmul | 1.82 GFLOP/s | 14.97 GFLOP/s | 105.6 GFLOP/s | NumPy 49.3 (1T), 142 (12T) |
-| MLP epoch | 16.56 s | 2.08 s | 0.57 s | PyTorch 0.51 s (1T), 0.74 s (12T) |
-| CNN epoch | 88.45 s | 14.48 s | 4.10 s | PyTorch 6.62 s (1T), 4.85 s (12T) |
+| Workload | Phase 1 | Pure OCaml, 8T | BLAS f64 | BLAS f32 | Reference |
+|---|---|---|---|---|---|
+| 512×512 matmul | 1.82 GFLOP/s | 105.6 GFLOP/s | 660 GFLOP/s | 2234 GFLOP/s | NumPy 50 (1T), 144 (12T) |
+| MLP epoch | 16.56 s | 0.57 s | 0.21 s | 0.12 s | PyTorch 0.51 s (f64), 0.34 s (f32) |
+| CNN epoch | 88.45 s | 4.10 s | 3.14 s | 2.27 s | PyTorch 4.30 s (f64, 12T), 6.40 s (f32) |
 
 ### The Phase 1 baseline
 
@@ -55,6 +56,7 @@ The profile (macOS `sample` on `train_mnist.exe`) shows where the time goes:
 | Phase 4 (pure OCaml, multicore) | ≥ 25 GFLOP/s | ≤ 2 s | ≤ 10 s |
 | Phase 5 (BLAS backend) | within 1.5× of NumPy | within 2× of PyTorch | within 2× of PyTorch |
 | **Achieved after Phase 4** | **15.0 (1T), 105.6 (8T)** | **2.08 s (1T), 0.57 s (8T)** | **14.5 s (1T), 4.10 s (8T)** |
+| **Achieved after Phase 5** (BLAS f64) | **660 (4.6× NumPy)** | **0.21 s (2.4× faster)** | **3.14 s (1.4× faster)** |
 
 The numbers are goals, not predictions. Phase 1 exists to make every one of
 them measurable, and each phase's numbers are recorded in `bench/RESULTS.md`.
@@ -336,7 +338,7 @@ check with tolerances.
   made the conv bias gradient no faster on 8 threads than on 1. The partials
   are now padded onto separate 128-byte lines.
 
-## Phase 5: Optional BLAS / C backend through the functor
+## Phase 5: Optional BLAS / C backend through the functor ✅
 
 This is how FlockML closes the gap to "modern ML library" speed: the same
 kernels those libraries call. The `Autograd.Make (T : Tensor_intf.S)` design
@@ -371,6 +373,48 @@ already exists for this.
 **Done when** the Phase 5 targets are met, and the dependency-free build
 (`dune build` without the optional library's dependencies) still works.
 
+**Status.** Done 2026-11-26. All three targets are met, by a wide margin:
+- 512² matmul: 660 GFLOP/s, against NumPy's 144 on 12 threads.
+- MLP epoch: 0.21 s, against PyTorch's 0.51 s.
+- CNN epoch: 3.14 s, against PyTorch's 4.30 s.
+- Float32 brings the epochs to 0.12 s and 2.27 s.
+- Test accuracy in float64 is identical to the pure backend's at every
+  epoch.
+
+Item by item:
+- *Item 1:* `Flockml.Make (T)` builds the whole stack for a backend
+  (`Flockml.S`), and the top-level modules are `Flockml.Default =
+  Make (Tensor)`, so existing code and the README example are unchanged.
+  Each module (`Layer`, `Optim`, `Dataset`...) is now a functor with its
+  documented signature `S` in the same file. Autograd's global state (node
+  ids, the `no_grad` flag) is shared by every instance. Broadcasting's shape
+  arithmetic moved into `Layout`, which both backends use. Measured, the
+  pure backend is exactly as fast as before.
+- *Item 2:* `flockml.blas` (`blas/`):
+  - Storage is a Bigarray.
+  - `gemm_` calls CBLAS. `blas/config/discover` finds Accelerate on
+    macOS, or OpenBLAS / another CBLAS elsewhere.
+  - Every other kernel is C, written once for both element types in
+    `blas/kernels.h`, and split across domains with `Parallel`.
+  - Tensor memory comes from a recycling pool, and is charged to the minor
+    GC. Without that, the first version's CNN was slower than pure OCaml:
+    see RESULTS.md.
+  - vDSP wasn't needed: clang vectorises the plain loops.
+- *Item 3:* `Tensor_blas.F64` and `Tensor_blas.F32`, as two instances of
+  one functor over the Bigarray kind. The C stubs dispatch on the kind.
+- *Item 4:* the six test suites are functors over a backend (`test/suites/`).
+  `test_backends` runs all of them on `Tensor_blas.F64`. It also computes
+  every op, and a few MLP and CNN training steps, on both backends, and
+  checks they agree: to 1e-11 in float64, 1e-5 in float32. Gradient checks
+  run in float64 only. 669 tests in all.
+- *Dependency-free build:* the core library is untouched by `blas/`. With
+  no BLAS on the system, flockml.blas uses a portable C matrix multiply.
+  Without dune-configurator, `discover` falls back to a simpler version.
+  All three configurations were built and passed the full test suite.
+- *Not done:* thread control for Accelerate. It uses its own threads,
+  limited only by the `VECLIB_MAXIMUM_THREADS` environment variable, and
+  `FLOCKML_THREADS` doesn't affect it.
+
 ## Phase 6: Stretch
 
 - **Static graph replay.** For a fixed architecture and batch shape, record
@@ -392,6 +436,6 @@ Phase 1 (measure) ─▶ 2a (matmul) ─▶ 2b–2d (overheads) ─▶ 3 (memory
                                      └─▶ 4 (domains) ─▶ 5 (BLAS backend) ─▶ 6
 ```
 
-Phase 5's functor refactor (step 1) doesn't depend on the earlier phases.
-Doing it early makes the later backend work easier, but it isn't a
-performance change on its own, so it's listed with the phase that needs it.
+Phase 5's functor refactor (step 1) didn't depend on the earlier phases, but
+it isn't a performance change on its own, so it was done with the phase that
+needed it. Phases 1–5 are done; Phase 6 is next.

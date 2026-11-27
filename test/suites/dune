@@ -1,0 +1,7 @@
+; The test suites, each a functor over a backend (a Flockml.S), so the same
+; tests run on the default backend (test/test_*.exe) and on the BLAS one
+; (test/test_backends.exe).
+
+(library
+ (name flockml_tests)
+ (libraries flockml ounit2))
