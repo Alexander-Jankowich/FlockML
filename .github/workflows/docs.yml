@@ -1,0 +1,45 @@
+# Build the odoc API documentation and publish it to GitHub Pages, on every
+# push to main. Enable it once in the repository's settings: Pages, then
+# "Source: GitHub Actions". The site's front page is the `flockml` package
+# index; the tutorial and the PyTorch guide are in doc/.
+name: docs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.3"
+      - run: opam install . --deps-only --with-doc --yes
+      - run: opam install odoc --yes
+      # FLOCKML_BLAS=none: the docs don't need a BLAS on the runner.
+      - run: FLOCKML_BLAS=none opam exec -- dune build @doc
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _build/default/_doc/_html
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

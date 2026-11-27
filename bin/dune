@@ -1,3 +1,3 @@
 (executables
- (names xor train_mnist)
- (libraries flockml flockml.blas unix))
+ (names xor train_mnist train_cifar gpt regression)
+ (libraries flockml flockml.blas reference_models unix))

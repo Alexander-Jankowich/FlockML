@@ -1,0 +1,7 @@
+; The Phase 12 reference models, written with FlockML's public API only. The
+; examples in bin/ and the benchmarks in bench/ share them; their PyTorch twins
+; are in bench/torch_*.py.
+
+(library
+ (name reference_models)
+ (libraries flockml))

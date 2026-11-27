@@ -34,6 +34,7 @@ let suites_f64 =
   let module P = Flockml_tests.Numpy_tests.Make (F64) in
   let module Th = Flockml_tests.Torch_tests.Make (F64) in
   let module L = Flockml_tests.Layers_tests.Make (F64) in
+  let module D = Flockml_tests.Data_tests.Make (F64) in
   "suites on Tensor_blas.F64"
   >::: [
          T.suite;
@@ -45,6 +46,7 @@ let suites_f64 =
          P.suite;
          Th.suite;
          L.suite;
+         D.suite;
        ]
 
 (** How close a backend must be to the default one. *)

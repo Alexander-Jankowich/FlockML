@@ -710,6 +710,65 @@ module Make (B : Flockml.S) = struct
         | _ -> assert_failure "not linear" );
     ]
 
+  (* ------------------------------------------------------------------------ *)
+  (* The reference models of Phase 12                                         *)
+  (* ------------------------------------------------------------------------ *)
+
+  module R = Reference_models.Make (B)
+
+  let reference =
+    [
+      ( "ResNet-20: PyTorch's parameter count, and a training step" >:: fun _ ->
+        let model = R.resnet20 ~rng in
+        (* bench/torch_cifar.py prints 269722 for its twin *)
+        assert_equal ~printer:string_of_int 269_722 (Layer.num_params model);
+        let x = r [| 2; 32; 32; 3 |] in
+        let opt =
+          Optim.sgd ~lr:0.1 ~momentum:0.9 ~nesterov:true (Layer.params model)
+        in
+        let loss () =
+          Loss.cross_entropy
+            (Layer.forward ~train:true model (Var.const x))
+            [| 3; 7 |]
+        in
+        let l0 = Tensor.item (Var.value (loss ())) in
+        for _ = 1 to 3 do
+          Optim.zero_grad opt;
+          Var.backward (loss ());
+          Optim.step opt
+        done;
+        assert_bool "the loss falls" (Tensor.item (Var.value (loss ())) < l0) );
+      ( "GPT: PyTorch's parameter count, shapes, decay split" >:: fun _ ->
+        let c =
+          { R.vocab = 65; context = 128; dim = 128; heads = 4; layers = 4 }
+        in
+        let model = R.gpt ~rng c in
+        (* bench/torch_gpt.py prints 826368 for its twin *)
+        assert_equal ~printer:string_of_int 826_368 (Layer.num_params model);
+        let small =
+          R.gpt ~rng { c with context = 8; dim = 8; heads = 2; layers = 1 }
+        in
+        let x =
+          Tensor.of_array [| 2; 5 |]
+            (Array.init 10 (fun i -> float_of_int (i mod 65)))
+        in
+        assert_shape [| 2; 5; 65 |]
+          (Var.value (Layer.forward small (Var.const x)));
+        let decay, no_decay = R.decay_split small in
+        assert_bool "embeddings aren't decayed"
+          (List.mem_assoc "tok.w" no_decay && not (List.mem_assoc "tok.w" decay));
+        assert_bool "the head is decayed" (List.mem_assoc "head.w" decay) );
+      ( "character windows" >:: fun _ ->
+        let text = R.text_of_string "abcab" in
+        assert_equal [| 'a'; 'b'; 'c' |] text.chars;
+        assert_equal "cab" (R.decode text [| 2; 0; 1 |]);
+        let src = R.windows ~context:2 text.ids in
+        assert_equal 3 src.length;
+        let x, y = src.batch [| 2; 0 |] in
+        assert_tensor (t [| 2; 2 |] [| 2.; 0.; 0.; 1. |]) x;
+        assert_equal [| 0; 1; 1; 2 |] y );
+    ]
+
   let suite =
     "layers"
     >::: [
@@ -721,5 +780,6 @@ module Make (B : Flockml.S) = struct
            "state" >::: state;
            "models" >::: models;
            "init" >::: init;
+           "reference models" >::: reference;
          ]
 end

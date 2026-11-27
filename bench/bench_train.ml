@@ -1,56 +1,79 @@
-(** End-to-end training cost of the MNIST MLP and CNN from [bin/train_mnist.ml],
-    split into data loading, forward pass (including the loss), backward pass
-    and optimizer step, with heap and GC counts. Compare with
-    bench/torch_baseline.py. Always run in release mode:
+(** End-to-end training cost of the reference models, split into data loading,
+    forward pass (including the loss), backward pass and optimizer step, with
+    heap and GC counts:
+    - the MNIST MLP and CNN of [bin/train_mnist.ml] (Adam, batch 64);
+    - ResNet-20 on CIFAR-10 with augmentation, as in [bin/train_cifar.ml]
+      (Nesterov SGD, batch 128);
+    - the character-level GPT of [bin/gpt.ml] on Tiny Shakespeare (AdamW, batch
+      32 of 128 characters).
+
+    Compare with bench/torch_baseline.py, bench/torch_cifar.py and
+    bench/torch_gpt.py. Always run in release mode:
 
     {v
     dune exec --profile release bench/bench_train.exe
     dune exec --profile release bench/bench_train.exe -- --model cnn --steps 200
+    dune exec --profile release bench/bench_train.exe -- --model resnet20 --steps 50
     dune exec --profile release bench/bench_train.exe -- --backend blas32
     v}
 
-    By default every model trains for one full epoch (938 steps at batch size
-    64). With [--steps N] it stops after N steps, and the epoch column is
-    extrapolated from the per-step average. Output is a Markdown table. *)
+    Batches come from {!Dataset.loader}, which prepares the next one on a
+    background domain during the current step ([--no-prefetch] turns that off),
+    so the data column is the time the step waited for its batch. By default
+    every model trains for one full epoch; [--steps N] stops after N steps, and
+    the epoch column is extrapolated from the per-step average. Missing datasets
+    are replaced by random data of the same shape. Output is a Markdown table.
+*)
 
 open Flockml
 open Bench_util
 
-let data_dir = ref "data/mnist"
+let data_dir = ref ""
 let models = ref [ `Mlp; `Cnn ]
 let steps = ref 0
-let batch_size = ref 64
+let batch_size = ref 0
 let warmup = 3
-let reuse = ref true
+let prefetch = ref true
 
 let spec =
   [
     ( "--model",
       Arg.Symbol
-        ( [ "mlp"; "cnn"; "both" ],
+        ( [ "mlp"; "cnn"; "both"; "resnet20"; "gpt"; "all" ],
           function
           | "mlp" -> models := [ `Mlp ]
           | "cnn" -> models := [ `Cnn ]
+          | "resnet20" -> models := [ `Resnet20 ]
+          | "gpt" -> models := [ `Gpt ]
+          | "all" -> models := [ `Mlp; `Cnn; `Resnet20; `Gpt ]
           | _ -> models := [ `Mlp; `Cnn ] ),
-      " Which model to time (default both)" );
+      " Which model to time (default both: the MNIST MLP and CNN)" );
     ( "--steps",
       Arg.Set_int steps,
       " Training steps to time (default 0 = one full epoch)" );
-    ("--batch-size", Arg.Set_int batch_size, " Mini-batch size (default 64)");
+    ( "--batch-size",
+      Arg.Set_int batch_size,
+      " Mini-batch size (default 64 for MNIST, 128 for ResNet-20, 32 for GPT)"
+    );
     ( "--threads",
       Arg.Int Parallel.set_num_threads,
       " Threads for the tensor kernels (default: FLOCKML_THREADS, or up to 8)"
     );
-    ( "--no-reuse",
-      Arg.Clear reuse,
-      " Allocate every batch afresh instead of reusing one buffer" );
+    ( "--no-prefetch",
+      Arg.Clear prefetch,
+      " Prepare each batch in the training loop instead of in the background" );
     backend_arg;
     ( "--data-dir",
       Arg.Set_string data_dir,
-      " Location of the IDX files; random data is used if they are missing" );
+      " Location of the dataset (default data/mnist, data/cifar-10 or \
+       data/tinyshakespeare); random data is used if it is missing" );
   ]
 
-let model_name = function `Mlp -> "MLP 784-128-10" | `Cnn -> "CNN"
+let model_name = function
+  | `Mlp -> "MLP 784-128-10"
+  | `Cnn -> "CNN"
+  | `Resnet20 -> "ResNet-20"
+  | `Gpt -> "GPT (char)"
 
 type totals = {
   mutable data : float;
@@ -63,10 +86,82 @@ type totals = {
 let run (module B : Flockml.S) kind =
   let open B in
   let open Models (B) in
+  let module R = Reference_models.Make (B) in
   let rng = Random.State.make [| 42 |] in
-  let train, source = load_train ~data_dir:!data_dir ~flatten:(kind = `Mlp) in
-  let n = Dataset.length train in
-  let steps_per_epoch = (n + !batch_size - 1) / !batch_size in
+  let dir default = if !data_dir = "" then default else !data_dir in
+  let bs default = if !batch_size > 0 then !batch_size else default in
+  let gpt_config =
+    { R.vocab = 65; context = 128; dim = 128; heads = 4; layers = 4 }
+  in
+  (* The model, its optimizer, the batches of one epoch and their count, and
+     where the data came from. *)
+  let model, opt, batches, steps_per_epoch, source =
+    match kind with
+    | (`Mlp | `Cnn) as k ->
+        let train, source =
+          load_train ~data_dir:(dir "data/mnist") ~flatten:(k = `Mlp)
+        in
+        let model = build_model rng k in
+        let b = bs 64 in
+        ( model,
+          Optim.adam ~lr:1e-3 (Layer.params model),
+          Dataset.loader ~shuffle:true ~rng ~prefetch:!prefetch ~batch_size:b
+            (Dataset.labelled train),
+          (Dataset.length train + b - 1) / b,
+          source )
+    | `Resnet20 ->
+        let d = dir "data/cifar-10" in
+        let src, source =
+          if Sys.file_exists (Filename.concat d "data_batch_1.bin") then
+            (Cifar10.source ~dir:d Cifar10.Train, "CIFAR-10")
+          else
+            let rng = Random.State.make [| 0 |] in
+            ( Dataset.labelled
+                {
+                  Dataset.inputs =
+                    Tensor.rand_uniform ~rng ~lo:0. ~hi:1.
+                      [| 50000; 32; 32; 3 |];
+                  labels = Array.init 50000 (fun _ -> Random.State.int rng 10);
+                },
+              "synthetic (no CIFAR-10 files found)" )
+        in
+        let model = R.resnet20 ~rng in
+        let b = bs 128 in
+        ( model,
+          Optim.sgd ~lr:0.1 ~momentum:0.9 ~nesterov:true ~weight_decay:5e-4
+            (Layer.params model),
+          Dataset.loader ~shuffle:true ~rng ~prefetch:!prefetch
+            ~transform:(Transform.on_inputs R.cifar_augment)
+            ~batch_size:b src,
+          (src.length + b - 1) / b,
+          source )
+    | `Gpt ->
+        let file = Filename.concat (dir "data/tinyshakespeare") "input.txt" in
+        let ids, source =
+          if Sys.file_exists file then
+            ( (R.text_of_string
+                 (In_channel.with_open_bin file In_channel.input_all))
+                .ids,
+              "Tiny Shakespeare" )
+          else
+            let rng = Random.State.make [| 0 |] in
+            ( Array.init 1_000_000 (fun _ -> Random.State.int rng 65),
+              "synthetic (no Tiny Shakespeare file found)" )
+        in
+        let model = R.gpt ~rng gpt_config in
+        let decay, no_decay = R.decay_split model in
+        let b = bs 32 in
+        let src = R.windows ~context:gpt_config.context ids in
+        ( model,
+          Optim.adamw ~lr:1e-3 ~weight_decay:0.1
+            ~groups:[ Optim.group ~weight_decay:0. (List.map snd no_decay) ]
+            (List.map snd decay),
+          Dataset.loader ~shuffle:true ~rng ~prefetch:!prefetch ~batch_size:b
+            src,
+          (* an "epoch" of GPT training: as many characters as the text *)
+          Array.length ids / (b * gpt_config.context),
+          source )
+  in
   let steps =
     if !steps <= 0 then steps_per_epoch else min !steps steps_per_epoch
   in
@@ -74,14 +169,8 @@ let run (module B : Flockml.S) kind =
     invalid_arg
       (Printf.sprintf "bench_train: need more than %d steps (the warm-up)"
          warmup);
-  let model = build_model rng kind in
-  let opt = Optim.adam ~lr:1e-3 (Layer.params model) in
   let tot = { data = 0.; forward = 0.; backward = 0.; optim = 0. } in
-  let batches =
-    ref
-      (Dataset.batches ~shuffle:true ~reuse:!reuse ~rng ~batch_size:!batch_size
-         train)
-  in
+  let batches = ref batches in
   let step ~record =
     let t0 = now () in
     let x, labels =
@@ -136,7 +225,8 @@ let run (module B : Flockml.S) kind =
 
 let () =
   Arg.parse (Arg.align spec) (fun _ -> ()) "bench_train [options]";
-  Printf.printf "FlockML training, batch %d, Adam, %s\n\n" !batch_size
+  Printf.printf "FlockML training, %s, %s\n\n"
+    (if !prefetch then "batches prefetched" else "batches made in the loop")
     (environment ());
   Printf.printf
     "| %-14s | %5s | %7s | %7s | %7s | %7s | %7s | %8s | %8s | %6s | %6s |\n"

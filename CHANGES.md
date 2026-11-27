@@ -4,6 +4,14 @@ Changes that can break existing code, and changes in behaviour. New
 functions and modules are listed in [ROADMAP.md](ROADMAP.md) with their
 phase.
 
+## Phases 11 and 12: the data pipeline and reference models
+
+No breaking changes for code that uses the library. `Dataset.S` and
+`Metrics.S` have new members (sources, the loader, top-k accuracy,
+classification reports), and `Flockml.S` has new modules (`Cifar10`, `Csv`,
+`Transform`), so only code that implements those signatures itself needs
+updating. `Dataset.batches` gained an optional `?drop_last`.
+
 ## Phases 9 and 10: open layers, checkpoints, losses, optimizers, schedules
 
 Breaking:

@@ -1,0 +1,30 @@
+; Every OCaml block of tutorial.md is extracted, compiled and run by
+; `dune test`, so the tutorial can't fall out of step with the library. When
+; adding or removing a block, update the count and the names below.
+
+(executable
+ (name extract)
+ (modules extract))
+
+(rule
+ (targets tutorial_1.ml tutorial_2.ml tutorial_3.ml tutorial_4.ml tutorial_5.ml)
+ (deps tutorial.md)
+ (action
+  (run %{exe:extract.exe} tutorial.md tutorial 5)))
+
+(executables
+ (names tutorial_1 tutorial_2 tutorial_3 tutorial_4 tutorial_5)
+ (modules tutorial_1 tutorial_2 tutorial_3 tutorial_4 tutorial_5)
+ (libraries flockml))
+
+(rule
+ (alias runtest)
+ (action
+  (with-stdout-to
+   %{null}
+   (progn
+    (run %{exe:tutorial_1.exe})
+    (run %{exe:tutorial_2.exe})
+    (run %{exe:tutorial_3.exe})
+    (run %{exe:tutorial_4.exe})
+    (run %{exe:tutorial_5.exe})))))

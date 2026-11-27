@@ -1,4 +1,42 @@
-(** Classification metrics. *)
+(** Classification metrics, and a running average for logging. *)
+
+type report = {
+  precision : float array;
+  recall : float array;
+  f1 : float array;
+  support : int array;  (** how many examples of each class there are *)
+  accuracy : float;
+  macro_f1 : float;  (** the unweighted mean of [f1] *)
+  weighted_f1 : float;  (** the mean of [f1], weighted by [support] *)
+}
+(** Precision, recall and F1 of each class, as [sklearn]'s
+    [classification_report] computes them. A class that is never predicted has
+    precision 0, and one that never occurs has recall 0. *)
+
+(** A running (weighted) mean, for losses over an epoch. *)
+module Running = struct
+  type t = { mutable sum : float; mutable weight : float; mutable count : int }
+
+  let create () = { sum = 0.; weight = 0.; count = 0 }
+
+  (** [add ?weight r x] adds [x] with [weight] (default 1): weight a batch's
+      mean loss by its size to get the mean per example. *)
+  let add ?(weight = 1.) r x =
+    r.sum <- r.sum +. (weight *. x);
+    r.weight <- r.weight +. weight;
+    r.count <- r.count + 1
+
+  (** The mean so far, or [nan] before anything was added. *)
+  let mean r = if r.weight = 0. then Float.nan else r.sum /. r.weight
+
+  (** How many values were added. *)
+  let count r = r.count
+
+  let reset r =
+    r.sum <- 0.;
+    r.weight <- 0.;
+    r.count <- 0
+end
 
 module type S = sig
   type tensor
@@ -20,6 +58,34 @@ module type S = sig
   val pp_confusion_matrix : Format.formatter -> int array array -> unit
   (** Print a confusion matrix as an aligned table, true classes down the side
       and predicted classes across the top. *)
+
+  val top_k : k:int -> tensor -> int array array
+  (** The [k] highest-scoring classes of each row of a [[| n; classes |]] score
+      matrix, best first (ties go to the lower class). Raises [Invalid_argument]
+      unless [1 <= k <= classes]. *)
+
+  val top_k_accuracy : k:int -> scores:tensor -> labels:int array -> float
+  (** The fraction of rows whose label is among their [k] best classes. *)
+
+  type nonrec report = report = {
+    precision : float array;
+    recall : float array;
+    f1 : float array;
+    support : int array;
+    accuracy : float;
+    macro_f1 : float;
+    weighted_f1 : float;
+  }
+
+  val classification_report :
+    num_classes:int -> predictions:int array -> labels:int array -> report
+  (** Per-class precision, recall and F1. *)
+
+  val pp_report : ?names:string array -> Format.formatter -> report -> unit
+  (** Print a report as a table, one row per class. *)
+
+  module Running = Running
+  (** A running mean: [create], [add ?weight], [mean], [count], [reset]. *)
 end
 
 (** The module for one backend. *)
@@ -88,4 +154,100 @@ module Make (T : Tensor_intf.S) : S with type tensor = T.t = struct
         Array.iter (fun c -> Format.fprintf fmt "%6d" c) row)
       m;
     Format.fprintf fmt "@]"
+
+  module Running = Running
+
+  let top_k ~k scores =
+    let s = T.shape scores in
+    if Array.length s <> 2 || k < 1 || k > s.(1) then
+      invalid_arg
+        (Printf.sprintf "Metrics.top_k: k = %d for scores of shape %s" k
+           (Layout.shape_to_string s));
+    let n = s.(0) and c = s.(1) and a = T.to_array scores in
+    Array.init n (fun i ->
+        let idx = Array.init c Fun.id in
+        (* best first; stable, so equal scores keep the lower class first *)
+        Array.stable_sort
+          (fun x y -> Float.compare a.((i * c) + y) a.((i * c) + x))
+          idx;
+        Array.sub idx 0 k)
+
+  let top_k_accuracy ~k ~scores ~labels =
+    let best = top_k ~k scores in
+    check_lengths ~fn:"top_k_accuracy"
+      ~predictions:(Array.map (fun r -> r.(0)) best)
+      ~labels;
+    let n = Array.length labels in
+    if n = 0 then Float.nan
+    else
+      let hits = ref 0 in
+      Array.iteri (fun i l -> if Array.mem l best.(i) then incr hits) labels;
+      float_of_int !hits /. float_of_int n
+
+  type nonrec report = report = {
+    precision : float array;
+    recall : float array;
+    f1 : float array;
+    support : int array;
+    accuracy : float;
+    macro_f1 : float;
+    weighted_f1 : float;
+  }
+
+  let classification_report ~num_classes ~predictions ~labels =
+    let m = confusion_matrix ~num_classes ~predictions ~labels in
+    let ratio a b = if b = 0 then 0. else float_of_int a /. float_of_int b in
+    let support = Array.map (Array.fold_left ( + ) 0) m in
+    let predicted =
+      Array.init num_classes (fun j ->
+          Array.fold_left (fun acc row -> acc + row.(j)) 0 m)
+    in
+    let precision =
+      Array.init num_classes (fun j -> ratio m.(j).(j) predicted.(j))
+    in
+    let recall =
+      Array.init num_classes (fun j -> ratio m.(j).(j) support.(j))
+    in
+    let f1 =
+      Array.init num_classes (fun j ->
+          let p = precision.(j) and r = recall.(j) in
+          if p +. r = 0. then 0. else 2. *. p *. r /. (p +. r))
+    in
+    let total = Array.fold_left ( + ) 0 support in
+    let sumf = Array.fold_left ( +. ) 0. in
+    {
+      precision;
+      recall;
+      f1;
+      support;
+      accuracy = accuracy ~predictions ~labels;
+      macro_f1 =
+        (if num_classes = 0 then Float.nan
+         else sumf f1 /. float_of_int num_classes);
+      weighted_f1 =
+        (if total = 0 then Float.nan
+         else
+           sumf (Array.mapi (fun j f -> f *. float_of_int support.(j)) f1)
+           /. float_of_int total);
+    }
+
+  let pp_report ?names fmt r =
+    let name j =
+      match names with
+      | Some ns when j < Array.length ns -> ns.(j)
+      | _ -> string_of_int j
+    in
+    let w =
+      Array.fold_left max 8
+        (Array.init (Array.length r.f1) (fun j -> String.length (name j)))
+    in
+    Format.fprintf fmt "@[<v>%*s  precision  recall      f1  support" w "";
+    Array.iteri
+      (fun j f ->
+        Format.fprintf fmt "@,%*s  %9.4f  %6.4f  %6.4f  %7d" w (name j)
+          r.precision.(j) r.recall.(j) f r.support.(j))
+      r.f1;
+    Format.fprintf fmt
+      "@,@,%*s  accuracy %.4f, macro F1 %.4f, weighted F1 %.4f@]" w ""
+      r.accuracy r.macro_f1 r.weighted_f1
 end

@@ -3,8 +3,10 @@ _opam/
 *.install
 .merlin
 
-# datasets and generated artifacts
+# datasets, trained models and generated artifacts
 /data/
+/checkpoints/
+/*.safetensors
 *.dot
 *.svg
 *.png

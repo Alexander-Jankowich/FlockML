@@ -16,6 +16,7 @@
   test_numpy
   test_torch
   test_layers
+  test_data
   test_backends)
  (deps
   (source_tree fixtures))

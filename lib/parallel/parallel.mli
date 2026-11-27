@@ -30,6 +30,13 @@ val parallel_for : ?work:int -> int -> (int -> int -> unit) -> unit
     allocating: OCaml's minor collections pause every domain. Nested and
     concurrent calls are safe and run sequentially. *)
 
+val sequentially : (unit -> 'a) -> 'a
+(** [sequentially f] runs [f] with every {!parallel_for} in the current domain
+    sequential, without touching the pool. {!Background} runs its jobs this way,
+    so preparing a batch never takes the pool from the training step running in
+    another domain. Results are the same either way, since no kernel's output
+    depends on the thread count. *)
+
 val min_parallel_work : int ref
 (** Total work (in nanoseconds) below which {!parallel_for} stays sequential.
     Defaults to 50,000, or the [FLOCKML_MIN_PARALLEL_WORK] environment variable.

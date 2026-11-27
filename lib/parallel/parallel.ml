@@ -129,10 +129,21 @@ let set_num_threads n =
 
 let sequential body n = if n > 0 then body 0 n
 
+(** Whether the current domain must never use the pool: set for the data
+    loader's background domain, so that a batch being prepared can't take the
+    pool while the training step needs it. *)
+let outside_pool = Domain.DLS.new_key (fun () -> false)
+
+let sequentially f =
+  let saved = Domain.DLS.get outside_pool in
+  Domain.DLS.set outside_pool true;
+  Fun.protect ~finally:(fun () -> Domain.DLS.set outside_pool saved) f
+
 let parallel_for ?(work = 1) n body =
   let threads = num_threads () in
   let total = n * max work 1 in
   if threads <= 1 || n <= 1 || total < !min_parallel_work then sequential body n
+  else if Domain.DLS.get outside_pool then sequential body n
   else if not (Atomic.compare_and_set busy false true) then sequential body n
   else begin
     Fun.protect

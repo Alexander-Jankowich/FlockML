@@ -44,6 +44,19 @@ module type S = sig
   module Mnist : Mnist.S with type dataset = Dataset.t
   (** The MNIST / Fashion-MNIST loader. *)
 
+  (** The CIFAR-10 loader. *)
+  module Cifar10 :
+    Cifar10.S
+      with type tensor = Tensor.t
+       and type dataset = Dataset.t
+       and type ('e, 'b) source = ('e, 'b) Dataset.source
+
+  module Csv : Csv.S with type tensor = Tensor.t
+  (** CSV files of numbers. *)
+
+  module Transform : Transform.S with type tensor = Tensor.t
+  (** Data augmentation on batches. *)
+
   module Metrics : Metrics.S with type tensor = Tensor.t
   (** Predictions, accuracy, confusion matrices. *)
 
@@ -72,6 +85,9 @@ module Make (T : Tensor_intf.S) : S with module Tensor = T = struct
   module Optim = Optim.Make (T) (Var)
   module Dataset = Dataset.Make (T)
   module Mnist = Mnist.Make (T) (Dataset)
+  module Cifar10 = Cifar10.Make (T) (Dataset)
+  module Csv = Csv.Make (T)
+  module Transform = Transform.Make (T)
   module Metrics = Metrics.Make (T)
   module Npy = Npy.Make (T)
   module Safetensors = Safetensors.Make (T)
@@ -89,6 +105,7 @@ module Tensor_derived = Tensor_derived
 module Parallel = Parallel
 module Rng = Rng
 module Schedule = Schedule
+module Background = Background
 
 let manual_seed = Rng.manual_seed
 
@@ -105,6 +122,9 @@ module Loss = Default.Loss
 module Optim = Default.Optim
 module Dataset = Default.Dataset
 module Mnist = Default.Mnist
+module Cifar10 = Default.Cifar10
+module Csv = Default.Csv
+module Transform = Default.Transform
 module Metrics = Default.Metrics
 module Npy = Default.Npy
 module Safetensors = Default.Safetensors

@@ -4,4 +4,4 @@
 
 (library
  (name flockml_tests)
- (libraries flockml ounit2))
+ (libraries flockml reference_models ounit2))

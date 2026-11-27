@@ -5,7 +5,7 @@ This roadmap has two parts:
   PyTorch and NumPy on the same CPU. Phases 1–5 are done.
 - **[Part 2, feature parity (Phases 7–13)](#part-2-feature-parity-with-pytorch-and-numpy).**
   Be able to express the models people build with PyTorch and the array code
-  people write with NumPy. Phases 7–10 are done.
+  people write with NumPy. Phases 7–12 are done.
 
 # Part 1: Performance
 
@@ -852,7 +852,7 @@ same result as one that never stopped.
   `Checkpoint` stores. Gradient accumulation is documented in the README,
   and a test checks that two half batches give the full batch's gradient.
 
-## Phase 11: Data pipeline
+## Phase 11: Data pipeline ✅
 
 1. **General datasets.** Targets can be a tensor (for regression,
    multi-label and sequences), not only an `int array`. A dataset signature
@@ -875,7 +875,52 @@ same result as one that never stopped.
 **Done when** CIFAR-10 trains with augmentation while data loading overlaps
 compute. `bench_train`'s data time per step should be close to zero.
 
-## Phase 12: Reference models and documentation
+**Status.** Done 2026-11-27. All five items are done, and the condition
+holds. `bench_train --model resnet20` trains ResNet-20 on CIFAR-10 with
+random crops, flips and normalisation. The step waits 0.006 ms for its
+batch, against 2.1 ms when the batch is made in the loop. For the MNIST CNN,
+data time went from 0.04 to 0.004 ms per step. `test_data` covers the phase
+with 18 tests.
+- *Item 1:* `('example, 'batch) Dataset.source` has a third field beyond
+  the plan's `length` and `get`: `batch`, which reads several examples at
+  once.
+  - An in-memory dataset, or CIFAR-10's bytes, makes a whole batch with one
+    copy instead of one per example.
+  - Constructors: `labelled` (today's `Dataset.t`, unchanged, as are MNIST
+    and `batches`), `of_tensors` (tensor targets), `of_fn` (lazy, with a
+    `collate`) and `subset`.
+- *Item 2:* `Dataset.loader ?shuffle ?drop_last ?transform ?prefetch`.
+  `batches` also gained `?drop_last`.
+  - `collate` belongs to the source (`of_fn ~collate`) rather than the
+    loader, because the in-memory sources don't need one.
+  - Prefetching runs on `Background`: one domain outside `Parallel`'s pool
+    that makes batch `k + 1` while the caller trains on batch `k`.
+  - Its kernels run sequentially (`Parallel.sequentially`). The pool
+    belongs to whichever domain claims it first, so a transform holding it
+    would make the training step's kernels run on one thread.
+  - A test checks that prefetching gives exactly the batches of the plain
+    loop, transforms included. The transforms draw from a generator split
+    from the loader's, in batch order.
+- *Item 3:* `Transform`:
+  - `random_crop ?padding`, `random_hflip`, `random_vflip`, `normalize`
+    and `normalize_`, plus `compose` and `on_inputs`.
+  - Only `normalize_` works in place. The others allocate, which costs the
+    step nothing while they run on the background domain.
+- *Item 4:*
+  - `Cifar10.source` keeps the file's bytes and converts a batch at a time,
+    which takes 150 MB for the training set instead of 1.2 GB of float64.
+    `Cifar10.load` converts everything at once.
+  - `Csv.load` detects the separator and the header, and `Csv.columns`
+    selects columns by name.
+  - `.npy` data needs only `Npy.load` and `Dataset.of_tensors`, so it has
+    no loader or download script of its own.
+  - There are download scripts for CIFAR-10, Tiny Shakespeare and the UCI
+    wine-quality CSV.
+- *Item 5:* `Metrics.top_k`, `top_k_accuracy`, `classification_report`
+  (checked against scikit-learn's values), `pp_report`, and
+  `Metrics.Running`, a weighted running mean.
+
+## Phase 12: Reference models and documentation ✅
 
 These models are the end-to-end test that the API is enough. Each one gets
 an example in `bin/`, a results row in the README, and a PyTorch version in
@@ -898,6 +943,38 @@ an example in `bin/`, a results row in the README, and a PyTorch version in
 
 **Done when** models 1 and 2 reach accuracy (or loss) within noise of their
 PyTorch versions, and their epoch times are recorded in `RESULTS.md`.
+
+**Status.** Done 2026-11-27. The condition holds, with the numbers in
+`bench/RESULTS.md` (Phases 11–12) and the README's results table.
+- *The models* are in a library of their own, `reference_models`
+  (`models/`), written only with the public API. `bin/`, `bench_train` and
+  the tests share them. Each has a PyTorch twin in `bench/torch_*.py` with
+  the same initialisation, hyperparameters and data pipeline.
+- *Item 1:* `bin/train_cifar.ml`. ResNet-20 (269,722 parameters, option-A
+  shortcuts) reaches 89.41% test accuracy in 20 epochs; PyTorch reaches
+  89.18%. A step takes 197 ms on the BLAS backend in float32 (77 s per
+  epoch), against 503 ms for PyTorch 2.0.1, a build without oneDNN.
+- *Item 2:* `bin/gpt.ml`. The GPT (4 layers, 4 heads, dim 128, 826,368
+  parameters) reaches a median validation loss of 1.569 over three seeds,
+  against PyTorch's 1.563; one of FlockML's seeds is an outlier at 1.626
+  (see `RESULTS.md`). A step takes 113 ms, against PyTorch's 106 ms. `--steps 0` samples from a saved checkpoint without training.
+- *Item 3:* `bin/regression.ml`, on the UCI wine-quality CSV: test RMSE
+  0.673 against PyTorch's 0.672, mean of five seeds each.
+- *Checkpoints:* both long runs save to `--checkpoint` and continue with
+  `--resume`. `checkpoints/` is in `.gitignore`; the README shows how to
+  evaluate, sample from and inspect a saved model.
+- *Item 4:*
+  - `doc/tutorial.md` covers the five planned steps. `dune test` extracts,
+    compiles and runs each of its code blocks (`doc/extract.ml`), so the
+    tutorial can't fall out of date.
+  - `doc/pytorch.md` maps tensors, autograd, layers, losses, optimizers and
+    schedules, data and checkpoints from `torch` to FlockML.
+  - `.github/workflows/docs.yml` builds the odoc site without BLAS and
+    deploys it to GitHub Pages. It runs once it is pushed and Pages is set
+    to "GitHub Actions" in the repository's settings.
+- *Profile, for Phase 6:* a ResNet-20 step is 70% backward, and allocates
+  about 2.7 GB of tensors (21 collections). The GPT's attention, layer norm
+  and GELU are still compositions of `Var` ops.
 
 ## Phase 13: Packaging and tooling
 
@@ -932,6 +1009,7 @@ PyTorch versions, and their epoch times are recorded in `RESULTS.md`.
   the set of ops and layers it must replay is known, including `Custom`
   layers and ops.
 
-Phases 7–10 are done. CI (13.1) isn't set up yet. Phase 11 (data) and
-Phase 12 (reference models) are next. Phase 6's graph replay can start now
-that the set of layers is known.
+Phases 7–12 are done. CI (13.1) isn't set up yet, and is next, with the
+rest of Phase 13. Phase 6's graph replay and fusion can start now: the
+reference models give it real workloads, and their profiles (Phase 12's
+status) say where to start.

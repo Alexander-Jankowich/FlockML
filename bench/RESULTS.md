@@ -496,3 +496,128 @@ per parameter. The `bench_ops` optimizer rows, alternating four times
 - **Cross-entropy with label smoothing or class weights avoids `gather`.**
   It multiplies the log-probabilities by one constant target matrix, so the
   BLAS backend's slow `gather` (see Phases 7–8) stays off the training path.
+
+## Phases 11–12: the data pipeline and reference models (2026-11-27)
+
+**Machine:** Apple M2 Pro (12 cores). **FlockML:** release profile, 8
+threads, BLAS backend (Accelerate) unless stated. **PyTorch:** 2.0.1, CPU,
+built with `USE_MKLDNN=OFF` (no oneDNN) and NNPACK; the twins in `bench/`
+use the same architecture, initialisation, hyperparameters, augmentation
+and schedule as `bin/`. To reproduce:
+
+```sh
+dune exec --profile release bench/bench_train.exe -- --model resnet20 --backend blas32
+dune exec --profile release bench/bench_train.exe -- --model gpt --backend blas32
+python3 bench/torch_cifar.py --steps 40 --threads 4     # timing only
+python3 bench/torch_gpt.py --steps 300 --threads 4
+dune exec --profile release bin/train_cifar.exe          # full runs
+dune exec --profile release bin/gpt.exe
+python3 bench/torch_cifar.py && python3 bench/torch_gpt.py --threads 4
+```
+
+### Data loading overlaps compute (Phase 11)
+
+`bench_train`'s data column is the time the step waits for its batch:
+
+| Model | Prefetch off | Prefetch on |
+|---|---|---|
+| ResNet-20, CIFAR-10 with crop + flip + normalise, batch 128 | 2.1 ms | 0.006 ms |
+| CNN, MNIST, batch 64 | 0.043 ms | 0.004 ms |
+
+With prefetching, the batch is read, augmented and normalised on the
+background domain while the previous step runs, and the step barely waits.
+The step itself is no slower: 193 ms with prefetching, 200 ms without.
+
+### Step and epoch times (Phase 12)
+
+Wall clock per training step, with the epoch time it implies (391 steps of
+128 images for ResNet-20). FlockML from `bench_train`, idle machine:
+
+| Model | FlockML BLAS f32 | FlockML BLAS f64 | FlockML pure OCaml | PyTorch f32 |
+|---|---|---|---|---|
+| ResNet-20, batch 128 | 197 ms (77 s) | 404 ms (158 s) | 1683 ms (658 s) | 503 ms (197 s), 4 threads; 511 ms at 8; 567 ms at 12 |
+| GPT, batch 32 × 128 | 110 ms | 217 ms | | 111 ms, 4 threads; 111 ms at 8; 119 ms at 12 |
+
+PyTorch in float64 takes 484 ms per ResNet-20 step. Over whole 3000-step
+GPT runs on an idle machine (seeds 1 and 2, which include evaluation
+pauses), the in-loop averages are 113 ms for FlockML and 106 ms for PyTorch
+at 4 threads.
+
+The ResNet-20 step splits into 60 ms forward, 136 ms backward and 0.2 ms
+optimizer. Each step runs 21 minor and 21 major collections in f32
+(41 in f64). The BLAS backend asks for one per `FLOCKML_GC_BUDGET_MB`
+(128 MB) of tensors allocated, so that temporaries return to its pool
+promptly: a ResNet-20 step allocates about 2.7 GB of tensors in f32.
+
+### Accuracy and loss against PyTorch
+
+**ResNet-20 on CIFAR-10**, 20 epochs, Nesterov SGD (lr 0.1, momentum 0.9,
+weight decay 5e-4), cosine schedule per step, batch 128, random crop with
+padding 4 and horizontal flip. Test accuracy after epoch:
+
+| Epoch | 1 | 5 | 10 | 15 | 20 |
+|---|---|---|---|---|---|
+| FlockML | 48.45% | 76.00% | 82.58% | 86.33% | **89.41%** |
+| PyTorch | 45.46% | 74.41% | 76.47% | 85.97% | **89.18%** |
+
+One seed each: at idle speed a run takes 26 minutes for FlockML and 66 for
+PyTorch. ResNet-20 runs usually differ by a few tenths of a percent between
+seeds, so the final difference of 0.23% can't be told apart from seed
+noise. Mid-training accuracy swings by several points
+from epoch to epoch in both, as the learning rate is still high. FlockML's
+top-5 accuracy is 99.63%; its per-class F1 runs from 0.79 (cat) to 0.96
+(automobile).
+
+**Character GPT on Tiny Shakespeare**, 3000 steps, AdamW (lr 1e-3, betas
+0.9 / 0.99, weight decay 0.1 on matrices), 100 warmup steps then cosine to
+1e-4, gradient clipping at 1.0. Validation loss after 3000 steps, over 20
+fixed batches:
+
+| | Seed 42 | Seed 1 | Seed 2 | Median | Mean |
+|---|---|---|---|---|---|
+| FlockML | 1.5663 | 1.6257 | 1.5687 | 1.569 | 1.587 |
+| PyTorch | 1.5887 | 1.5632 | 1.5562 | 1.563 | 1.569 |
+
+The two libraries draw different random numbers, so equal seeds don't
+pair up runs. Two of FlockML's three runs land inside PyTorch's range; its
+seed-1 run is the outlier of the six, 0.04 above the next worst, and its
+training loss was higher throughout (1.41 at the end, against 1.30–1.36 for
+the other five). Three seeds can't tell whether that run is bad luck or a
+small systematic difference; more seeds would.
+
+**Regression on the wine-quality CSV** (1599 rows, 11 features, every fifth
+row held out for testing): MLP 11–64–64–1, Huber loss, Adam 1e-3, batch 32, 50 epochs,
+features standardised on the training rows. Test RMSE over seeds 1–5:
+
+| | Seed 1 | 2 | 3 | 4 | 5 | Mean |
+|---|---|---|---|---|---|---|
+| FlockML (f64) | 0.6748 | 0.6706 | 0.6900 | 0.6867 | 0.6404 | 0.6725 |
+| PyTorch (f64) | 0.6581 | 0.6758 | 0.6782 | 0.6742 | 0.6719 | 0.6716 |
+
+Predicting the training mean gives 0.8056. Mean MAE: 0.504 and 0.498.
+
+### What the numbers say
+
+- **Phase 12's condition holds.** ResNet-20 and the GPT reach PyTorch's
+  accuracy and loss within the noise between seeds, with the same
+  hyperparameters.
+- **FlockML trains ResNet-20 2.5 times as fast as this PyTorch.** Most of
+  that is PyTorch's side: without oneDNN its CPU convolutions take a
+  generic path. A PyTorch with oneDNN, or on a GPU, would be faster. What
+  the number does show is that `im2col` and one large BLAS matmul per
+  convolution make a ResNet practical on a laptop CPU.
+- **The GPT runs within 10% of PyTorch's speed** (113 ms against 106 ms per
+  step over a whole run). Both libraries spend most of the step in the same BLAS matmuls.
+  FlockML's attention, layer norm and GELU are still compositions of `Var`
+  ops, the likely place for the difference; a profile would confirm it.
+- **The backward pass is 70% of a ResNet step.** The candidates for Phase 6
+  are the convolution backward (one `col2im` per layer) and batch norm,
+  which is still a composition of several passes over memory.
+- **Allocation is the next cost to measure.** A ResNet-20 step allocates
+  about 2.7 GB of tensors, and so runs 21 collections. Fewer temporaries
+  (fused batch norm, in-place gradient accumulation) would cut both; a
+  larger `FLOCKML_GC_BUDGET_MB` trades memory for fewer collections, which
+  hasn't been measured on this model.
+- **Data loading is free.** A transform that costs 2 ms in the loop costs
+  the step nothing when prefetched, so augmentation doesn't need to be
+  written in place or in C.

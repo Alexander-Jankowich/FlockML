@@ -8,9 +8,15 @@ layers modern models are built from: convolutions, normalisation,
 embeddings, attention and recurrent cells, plus user-defined layers. It has
 PyTorch's losses, optimizers (SGD, Adam, AdamW, RMSprop, Adagrad) and
 learning-rate schedules, checkpoints in the safetensors format that PyTorch
-reads and writes, and a complete MNIST training pipeline. The core uses no
-numerical libraries, only the OCaml standard library. An optional second backend, `flockml.blas`, runs the same code on
+reads and writes, and a data pipeline that prepares batches on a background
+domain while the model trains. Reference models (ResNet-20 on CIFAR-10, a
+character-level GPT, regression on a CSV file) are trained against PyTorch
+twins. The core uses no numerical libraries, only the OCaml standard
+library. An optional second backend, `flockml.blas`, runs the same code on
 Bigarrays with BLAS, in float64 or float32.
+
+New to FlockML? Start with the [tutorial](doc/tutorial.md), or, coming from
+PyTorch, the [guide for PyTorch users](doc/pytorch.md).
 
 On MNIST, a two-layer MLP reaches **97.3%** test accuracy after 3 epochs, and a
 small CNN reaches **98.2%**. On 8 threads of an Apple M2 Pro:
@@ -38,10 +44,56 @@ dune exec bin/xor.exe              # a tiny MLP learns XOR in under a second
 dune exec --profile release bin/train_mnist.exe -- --epochs 3
 dune exec --profile release bin/train_mnist.exe -- --model cnn
 dune exec --profile release bin/train_mnist.exe -- --backend blas32
+
+./scripts/download_cifar10.sh      # CIFAR-10 into data/cifar-10 (~160 MB)
+dune exec --profile release bin/train_cifar.exe -- --checkpoint checkpoints/resnet20_cifar10.safetensors
+./scripts/download_shakespeare.sh  # Tiny Shakespeare (~1 MB)
+dune exec --profile release bin/gpt.exe -- --checkpoint checkpoints/gpt_shakespeare.safetensors --sample 500
+./scripts/download_wine.sh         # UCI wine quality, a CSV (~100 KB)
+dune exec --profile release bin/regression.exe
 ```
 
 Use `--profile release` for anything performance-sensitive: it turns on
 optimisations that the default dev profile leaves off.
+
+### Using a trained model
+
+`--checkpoint` saves the model and its optimizer after every epoch (CIFAR)
+or evaluation (GPT). `checkpoints/` and `data/` are in `.gitignore`, so
+trained models and datasets never reach the repository. To use a saved
+model:
+
+```sh
+# Evaluate ResNet-20: a per-class precision / recall / F1 table on the test set.
+# --resume continues after the saved epoch; at the last epoch it only evaluates.
+dune exec --profile release bin/train_cifar.exe -- \
+  --checkpoint checkpoints/resnet20_cifar10.safetensors --resume
+
+# Sample from the GPT without training (--steps 0). Change --seed for a new
+# sample, --temperature or --top-k for a different style.
+dune exec --profile release bin/gpt.exe -- \
+  --checkpoint checkpoints/gpt_shakespeare.safetensors --steps 0 --sample 1000 --seed 7
+
+# An interrupted run: the same command plus --resume continues it from the
+# last saved epoch, with the same data order and learning rate as if it had
+# never stopped. (gpt.exe takes --resume the same way.)
+dune exec --profile release bin/train_cifar.exe -- \
+  --checkpoint checkpoints/resnet20_cifar10.safetensors --resume
+```
+
+A checkpoint is a plain [safetensors](https://github.com/huggingface/safetensors)
+file, so it can also be inspected from Python (`pip install safetensors`):
+
+```python
+from safetensors.numpy import load_file
+weights = load_file("checkpoints/resnet20_cifar10.safetensors")
+for name, w in weights.items():
+    print(name, w.shape, w.dtype)
+```
+
+The names are FlockML's parameter names (`"0.w"`, `"3.conv1.w"`...), and
+optimizer state is stored under `optim.`. To load the weights into a PyTorch
+model, see `scripts/check_torch_interop.py`, which converts every layer type.
 
 ## Example
 
@@ -222,13 +274,15 @@ binary classification.
 | `Schedule` | Learning-rate schedules as functions of the step: step, multi-step, exponential, cosine, linear, warmup, one-cycle, and reduce-on-plateau |
 | `Init` | He (normal), Kaiming (uniform, PyTorch's default), Xavier (uniform and normal), orthogonal, constant; any of them through a constructor's `?init` |
 | `Checkpoint`, `Safetensors` | Save and load a model and its optimizer as `.safetensors`, readable by PyTorch; read and write any safetensors file |
-| `Dataset` | In-memory datasets, Fisher–Yates shuffling, lazy mini-batches, train/validation splits |
-| `Mnist` | IDX file loader for MNIST and Fashion-MNIST |
-| `Metrics` | Argmax predictions, accuracy, confusion matrices |
+| `Dataset` | In-memory datasets, and general sources (tensor targets, lazy or on-disk examples, subsets); a loader with shuffling, `drop_last`, transforms and prefetching on a background domain; splits |
+| `Transform` | Batch augmentation: random crop with padding, flips, normalisation, composition |
+| `Mnist`, `Cifar10`, `Csv` | Loaders for MNIST and Fashion-MNIST (IDX), CIFAR-10 (binary, decoded a batch at a time), and CSV files of numbers |
+| `Metrics` | Predictions, accuracy, top-k accuracy, confusion matrices, per-class precision / recall / F1, a running average |
 | `Npy` | Read and write NumPy `.npy` files: float64/32, integers and booleans, either byte order, C or Fortran order |
 | `Rng` | The global default random generator, with `manual_seed` and `permutation` |
 | `Graphviz` | Export any computation graph to DOT for visualisation |
 | `Parallel` | A small pool of OCaml 5 domains that the tensor kernels use for data parallelism |
+| `Background` | One more domain, outside that pool, on which the data loader prepares the next batch |
 | `Make`, `S`, `Default` | `Flockml.Make (T)` builds all of the above for a tensor backend `T`. The top-level modules are `Default = Make (Tensor)` |
 | `Layout`, `Tensor_derived` | Shape and broadcasting arithmetic, and the tensor functions written once for every backend (compositions, and every structural op as one strided copy) |
 | `Tensor_blas` (`flockml.blas`) | The optional backend: `F64` and `F32` tensors on Bigarrays, matmul through BLAS (Accelerate or OpenBLAS), every other kernel in vectorised C |
@@ -253,8 +307,8 @@ Run `dune build @doc` to generate HTML documentation in
 
 ## Results
 
-Measured on an Apple M2 Pro, release profile, with Adam at learning rate
-1e-3 and batch size 64:
+Measured on an Apple M2 Pro, release profile. The MNIST models use Adam at
+learning rate 1e-3 and batch size 64:
 
 | Model | Data | Parameters | Test accuracy | Epoch, 8 threads | Epoch, 1 thread | BLAS f64 | BLAS f32 |
 |---|---|---|---|---|---|---|---|
@@ -275,7 +329,31 @@ After training, `train_mnist` prints a confusion matrix showing which digits
 are mistaken for which. For the MLP run above, the most common mistakes were
 7 read as 2, 3 and 8 confused with each other, and 9 read as 3 or 4.
 
-### Training options
+### Reference models
+
+The three reference models in `models/`, each against a PyTorch twin in
+`bench/` with the same architecture, initialisation, hyperparameters and
+data pipeline. Same machine; FlockML on the BLAS backend in float32 with 8
+threads, PyTorch 2.0.1 in float32. Step times were measured on an idle
+machine: ResNet-20's with `bench_train` and `torch_cifar.py --steps`, the
+GPT's over whole runs.
+
+| Model | Data | Parameters | FlockML | PyTorch | Step, FlockML | Step, PyTorch |
+|---|---|---|---|---|---|---|
+| ResNet-20 | CIFAR-10, 20 epochs, crop + flip | 269,722 | 89.41% test accuracy | 89.18% | 197 ms (77 s / epoch) | 503 ms (197 s / epoch) |
+| GPT, 4 layers × 4 heads, dim 128 | Tiny Shakespeare, 3000 steps of 32 × 128 characters | 826,368 | 1.569 validation loss | 1.563 | 113 ms | 106 ms |
+| MLP 11–64–64–1, Huber loss | wine quality (CSV), 50 epochs | 4,993 | 0.673 test RMSE | 0.672 | | |
+
+The GPT row is the median of three seeds, the regression row the mean of
+five (predicting the mean gives 0.806); ResNet-20 is one run each.
+PyTorch's best thread count was 4. Its ResNet step is slow partly because
+this build of PyTorch has no oneDNN, so its CPU convolutions take a generic
+path: read that column as "FlockML trains ResNet-20 in reasonable time",
+not as a general claim.
+[bench/RESULTS.md](bench/RESULTS.md#phases-1112-the-data-pipeline-and-reference-models-2026-11-27)
+has the accuracy curves, every seed, and float64 and pure-OCaml times.
+
+### `train_mnist` options
 
 ```
 --model mlp|cnn     architecture (default mlp)
@@ -409,7 +487,8 @@ The interfaces stay simple; the speed comes from how the kernels in
 
 ## Testing
 
-`dune test` runs 1351 tests in ten executables, which can also be run one
+`dune test` runs 1393 tests in eleven executables, and runs every code block of the
+tutorial, which can also be run one
 at a time. The suites themselves are functors over a backend (`test/suites/`),
 so the same tests run on both backends:
 
@@ -422,9 +501,10 @@ so the same tests run on both backends:
 | `test_conv` | `im2col`/`col2im` adjointness, gradient checks of `im2col`, `max_pool2d` and a full conv layer, graph export |
 | `test_kernels` | every fast kernel against a plain reference on awkward shapes, gradient checks of the fused ops, gradient-buffer ownership, and bit-identical results at 1, 2, 3 and 8 threads |
 | `test_numpy` | the NumPy-level API against NumPy's own outputs (`.npy` fixtures written by `test/fixtures/gen.py`), plus empty and size-1 axes, NaN rules, errors, the `.npy` reader and the global generator |
-| `test_layers` | gradient checks of every layer, with respect to its input and parameters; named parameters, custom and residual layers, summaries; `state_dict`, safetensors and checkpoints, including a resumed run that matches an uninterrupted one bit for bit; a ResNet-style CNN and a small transformer, written with the public API, that train |
+| `test_layers` | gradient checks of every layer, with respect to its input and parameters; named parameters, custom and residual layers, summaries; `state_dict`, safetensors and checkpoints, including a resumed run that matches an uninterrupted one bit for bit; a ResNet-style CNN and a small transformer, written with the public API, that train; the reference models' parameter counts, shapes and first training steps |
 | `test_torch` | layers, losses (values and gradients), optimizers (parameters after 10 steps) and schedules against PyTorch's own outputs (fixtures written by `test/fixtures/gen_torch.py`), and a safetensors file with every dtype |
-| `test_backends` | all nine suites again on `Tensor_blas.F64`, then every op, a few training steps of MLPs, CNNs and the Phase 9 layers, and an attention block's gradients on both backends, checked to agree (to 1e-11 in float64, 1e-5 in float32) |
+| `test_data` | datasets and the loader (coverage, `drop_last`, prefetching giving exactly the plain loop's batches), the background domain, transforms, the CIFAR-10 and CSV readers, and the new metrics against scikit-learn's values |
+| `test_backends` | all ten suites again on `Tensor_blas.F64`, then every op, a few training steps of MLPs, CNNs and the Phase 9 layers, and an attention block's gradients on both backends, checked to agree (to 1e-11 in float64, 1e-5 in float32) |
 
 The central tool is the **gradient check** in `test/suites/helpers.ml`. It compares
 every gradient that autograd computes against a central finite difference,
@@ -518,12 +598,16 @@ lib/
     optim.ml               SGD, Adam, AdamW, RMSprop, Adagrad; parameter groups
     schedule.ml            learning-rate schedules
   data/
-    dataset.ml             in-memory dataset, shuffling, lazy mini-batches
+    dataset.ml             datasets, sources, the prefetching loader
+    background.ml          the background domain the loader uses
+    transform.ml           batch augmentation
     mnist.ml               IDX file loader (MNIST and Fashion-MNIST)
+    cifar10.ml             CIFAR-10 binary loader
+    csv.ml                 CSV files of numbers
   io/
     npy.ml                 NumPy .npy reader and writer
     safetensors.ml         safetensors reader and writer
-  metrics.ml               accuracy, confusion matrix
+  metrics.ml               accuracy, top-k, confusion matrix, precision/recall/F1
   viz/graphviz.ml          export a computational graph to DOT
   parallel/parallel.ml(i)  domain pool: parallel_for over disjoint ranges
 blas/                      flockml.blas, the optional backend
@@ -531,18 +615,27 @@ blas/                      flockml.blas, the optional backend
   tensor_blas_stubs.c      C stubs: CBLAS gemm, the tensor memory pool
   kernels.h                the C kernels, written once for float and double
   config/                  finds the BLAS at build time
+models/                    the reference models (ResNet-20, GPT, regression MLP), on the public API
+checkpoints/               trained models (.safetensors); gitignored
 bin/
   xor.ml                   smallest end-to-end example
   train_mnist.ml           MLP / CNN training CLI
+  train_cifar.ml           ResNet-20 on CIFAR-10
+  gpt.ml                   a character-level GPT on Tiny Shakespeare, with sampling
+  regression.ml            an MLP on a CSV file
+doc/
+  tutorial.md              tensors, autograd, layers, training, checkpoints
+  pytorch.md               FlockML for PyTorch users
 test/
   suites/                  one OUnit2 suite per subsystem, as a functor over a backend
   test_*.ml                runs each suite on the default backend
   test_backends.ml         every suite on the BLAS backend, and cross-backend agreement
   fixtures/                NumPy reference outputs, and gen.py that writes them;
                            torch/ holds PyTorch's, written by gen_torch.py
-bench/                     training, matmul and per-op benchmarks; PyTorch/NumPy baselines; RESULTS.md
+bench/                     training, matmul and per-op benchmarks; PyTorch/NumPy baselines
+                           and twins of the reference models (torch_*.py); RESULTS.md
 scripts/
-  download_mnist.sh        dataset download
+  download_*.sh            dataset downloads (MNIST, CIFAR-10, Tiny Shakespeare, wine)
   check_torch_interop.py   checkpoints between FlockML and PyTorch, both ways
   interop.ml               its FlockML half
 ```
