@@ -48,8 +48,17 @@ external sum_range : 'k buf -> int -> int -> (float[@unboxed])
   = "fb_sum_byte" "fb_sum"
 [@@noalloc]
 
-external reduce_axis_c : bool -> 'k buf -> 'k buf -> int array -> unit
+external reduce_axis_c : int -> 'k buf -> 'k buf -> int array -> unit
   = "fb_reduce_axis"
+[@@noalloc]
+
+external copy_walk_c :
+  'k buf -> 'k buf -> int array -> int array -> int -> int -> unit
+  = "fb_copy_walk_byte" "fb_copy_walk"
+[@@noalloc]
+
+external select_c : 'k buf -> 'k buf -> 'k buf -> 'k buf -> int -> int -> unit
+  = "fb_select_byte" "fb_select"
 [@@noalloc]
 
 external argmax_c : 'k buf -> int array -> int array -> unit = "fb_argmax_axis"
@@ -112,6 +121,10 @@ external max_pool_backward_c :
 external gemm_c : 'k buf -> 'k buf -> 'k buf -> int array -> float array -> unit
   = "fb_gemm"
 
+external gemm_batched_c :
+  'k buf -> 'k buf -> 'k buf -> int array -> float array -> int array -> unit
+  = "fb_gemm_batched_byte" "fb_gemm_batched"
+
 (* Operation codes: the enums at the top of tensor_blas_stubs.c. *)
 let un_copy = 0
 and un_neg = 1
@@ -123,6 +136,17 @@ and un_log = 6
 and un_sqrt = 7
 and un_relu = 8
 and un_fill = 9
+and un_abs = 10
+and un_sign = 11
+and un_square = 12
+and un_rsqrt = 13
+and un_log1p = 14
+and un_expm1 = 15
+and un_sin = 16
+and un_cos = 17
+and un_tanh = 18
+and un_sigmoid = 19
+and un_erf = 20
 
 let bin_add = 0
 and bin_sub = 1
@@ -131,6 +155,14 @@ and bin_div = 3
 and bin_relu_backward = 4
 and bin_axpy = 5
 and bin_copy_a = 6
+and bin_min = 7
+and bin_max = 8
+and bin_eq = 9
+and bin_ne = 10
+and bin_lt = 11
+and bin_le = 12
+and bin_gt = 13
+and bin_ge = 14
 
 let blas = blas_name ()
 
@@ -151,6 +183,12 @@ end
 
 module Make (K : KIND) : S = struct
   type t = { shape : int array; data : K.elt buf }
+
+  type range = Tensor_intf.range =
+    | All
+    | Index of int
+    | Range of int * int
+    | Step of int * int * int
 
   let dtype = K.dtype
 
@@ -228,6 +266,7 @@ module Make (K : KIND) : S = struct
     a.shape = b.shape && Tensor.allclose ?rtol ?atol (to_tensor a) (to_tensor b)
 
   let pp fmt t = Tensor.pp fmt (to_tensor t)
+  let to_string ?precision t = Tensor.to_string ?precision (to_tensor t)
 
   let flat_index t idx =
     if Array.length idx <> ndim t then
@@ -429,17 +468,28 @@ module Make (K : KIND) : S = struct
         (List.filteri (fun i _ -> i <> axis) (Array.to_list t.shape))
 
   (** The parallel structure of tensor.ml's [reduce_axis]: one task per outer
-      index, or per column range when reducing the leading axis. *)
-  let reduce_axis ~is_max ~keepdims t axis =
+      index, or per column range when reducing the leading axis. [mode] is 0 for
+      a sum, 1 for the maximum and 2 for the minimum. *)
+  let reduce_axis ~mode ~keepdims t axis =
     let axis =
-      normalize_axis ~fn:(if is_max then "max_axis" else "sum_axis") t axis
+      normalize_axis
+        ~fn:
+          (match mode with
+          | 0 -> "sum_axis"
+          | 1 -> "max_axis"
+          | _ -> "min_axis")
+        t axis
     in
     let outer, n, inner = split_around t axis in
     let out =
-      filled (outer * inner) (if is_max then Float.neg_infinity else 0.0)
+      filled (outer * inner)
+        (match mode with
+        | 0 -> 0.0
+        | 1 -> Float.neg_infinity
+        | _ -> Float.infinity)
     in
     let run olo ohi ilo ihi =
-      reduce_axis_c is_max t.data out [| n; inner; olo; ohi; ilo; ihi |]
+      reduce_axis_c mode t.data out [| n; inner; olo; ohi; ilo; ihi |]
     in
     if outer > 1 then
       Parallel.parallel_for ~work:(n * inner) outer (fun lo hi ->
@@ -449,18 +499,19 @@ module Make (K : KIND) : S = struct
     else if outer = 1 then run 0 1 0 inner;
     { shape = reduced_shape ~keepdims t axis; data = out }
 
-  let sum_axis ?(keepdims = false) t axis =
-    reduce_axis ~is_max:false ~keepdims t axis
+  let sum_axis ?(keepdims = false) t axis = reduce_axis ~mode:0 ~keepdims t axis
+  let max_axis ?(keepdims = false) t axis = reduce_axis ~mode:1 ~keepdims t axis
+  let min_axis ?(keepdims = false) t axis = reduce_axis ~mode:2 ~keepdims t axis
 
-  let max_axis ?(keepdims = false) t axis =
-    reduce_axis ~is_max:true ~keepdims t axis
-
-  let argmax_axis t axis =
-    let axis = normalize_axis ~fn:"argmax_axis" t axis in
+  let arg_extreme ~fn ~is_min t axis =
+    let axis = normalize_axis ~fn t axis in
     let outer, n, inner = split_around t axis in
     let res = Array.make (outer * inner) 0 in
-    argmax_c t.data res [| n; inner; 0; outer * inner |];
+    argmax_c t.data res [| n; inner; 0; outer * inner; Bool.to_int is_min |];
     res
+
+  let argmax_axis t axis = arg_extreme ~fn:"argmax_axis" ~is_min:false t axis
+  let argmin_axis t axis = arg_extreme ~fn:"argmin_axis" ~is_min:true t axis
 
   (* -------------------------------------------------------------------- *)
   (* Matrix multiplication                                                 *)
@@ -799,6 +850,202 @@ module Make (K : KIND) : S = struct
     if Atomic.get bad > 0 then
       invalid_arg "Tensor_blas.max_pool2d_backward: index out of bounds";
     wrap input_shape out
+
+  (* -------------------------------------------------------------------- *)
+  (* Elementwise math, comparisons and selection                           *)
+  (* -------------------------------------------------------------------- *)
+
+  let abs t = unary_op un_abs t
+  let sign t = unary_op un_sign t
+  let square t = unary_op un_square t
+  let rsqrt t = unary_op ~work:2 un_rsqrt t
+  let log1p t = unary_op ~work:5 un_log1p t
+  let expm1 t = unary_op ~work:5 un_expm1 t
+  let sin t = unary_op ~work:5 un_sin t
+  let cos t = unary_op ~work:5 un_cos t
+  let tanh t = unary_op ~work:5 un_tanh t
+  let sigmoid t = unary_op ~work:5 un_sigmoid t
+  let erf t = unary_op ~work:5 un_erf t
+  let minimum a b = binop bin_min a b
+  let maximum a b = binop bin_max a b
+  let eq a b = binop bin_eq a b
+  let ne a b = binop bin_ne a b
+  let lt a b = binop bin_lt a b
+  let le a b = binop bin_le a b
+  let gt a b = binop bin_gt a b
+  let ge a b = binop bin_ge a b
+
+  (** As in tensor.ml: broadcast what needs it, then one flat pass. *)
+  let where mask a b =
+    let shape =
+      broadcast_shapes (broadcast_shapes mask.shape a.shape) b.shape
+    in
+    let full x = if x.shape = shape then x else broadcast_to x shape in
+    let m = full mask and x = full a and y = full b in
+    let n = numel_of_shape shape in
+    let out = create n in
+    Parallel.parallel_for n (fun lo hi ->
+        select_c m.data x.data y.data out lo hi);
+    { shape; data = out }
+
+  (* -------------------------------------------------------------------- *)
+  (* More reductions and indexing                                          *)
+  (*                                                                       *)
+  (* prod_axis, cumsum, index_add, gather and scatter_add are cold paths:  *)
+  (* they go through the default backend, like map and the samplers.       *)
+  (* -------------------------------------------------------------------- *)
+
+  let max t =
+    reduce_axis ~mode:1 ~keepdims:false { t with shape = [| numel t |] } 0
+
+  let min t =
+    reduce_axis ~mode:2 ~keepdims:false { t with shape = [| numel t |] } 0
+
+  let prod_axis ?keepdims t axis =
+    of_tensor (Tensor.prod_axis ?keepdims (to_tensor t) axis)
+
+  let cumsum t axis = of_tensor (Tensor.cumsum (to_tensor t) axis)
+
+  let index_add t ~axis idx src =
+    of_tensor (Tensor.index_add (to_tensor t) ~axis idx (to_tensor src))
+
+  let gather t ~axis idx = of_tensor (Tensor.gather (to_tensor t) ~axis idx)
+
+  let scatter_add t ~axis idx src =
+    of_tensor (Tensor.scatter_add (to_tensor t) ~axis idx (to_tensor src))
+
+  (** The rows of [inner] elements that make up the result are rows of [t]
+      viewed as [[| outer * n; inner |]], so this is [take_rows] with one
+      composite index per output row. *)
+  let index_select t ~axis idx =
+    let axis = normalize_axis ~fn:"index_select" t axis in
+    let outer, n, inner = split_around t axis in
+    Array.iter
+      (fun i ->
+        if i < 0 || i >= n then
+          invalid_arg
+            (Printf.sprintf
+               "Tensor_blas.index_select: index %d out of range for an axis of \
+                %d"
+               i n))
+      idx;
+    let len = Array.length idx in
+    let rows =
+      Array.init (outer * len) (fun r -> (r / len * n) + idx.(r mod len))
+    in
+    let out = create (outer * len * inner) in
+    Parallel.parallel_for ~work:inner (outer * len) (fun lo hi ->
+        take_rows_c t.data out rows inner lo hi);
+    let shape = Array.copy t.shape in
+    shape.(axis) <- len;
+    { shape; data = out }
+
+  (* -------------------------------------------------------------------- *)
+  (* Batched matrix multiply                                               *)
+  (* -------------------------------------------------------------------- *)
+
+  (** One C call for the whole batch; see fb_gemm_batched. As in tensor.ml, a
+      single right-hand matrix makes it one tall [gemm_]. *)
+  let bmm ?(trans_a = false) ?(trans_b = false) a b =
+    let {
+      Layout.rows_a = ra;
+      cols_a = ca;
+      rows_b = rb;
+      cols_b = cb;
+      m;
+      n;
+      k;
+      batch_a = ba;
+      batch_b = bb;
+      batch;
+    } =
+      Layout.batched_matmul ~fn:"Tensor_blas.bmm" ~trans_a ~trans_b a.shape
+        b.shape
+    in
+    let nbatch = numel_of_shape batch in
+    let out_shape = Array.append batch [| m; n |] in
+    if Array.length bb = 0 && not trans_a then begin
+      let c = { shape = [| nbatch * m; n |]; data = create (nbatch * m * n) } in
+      gemm_ ~trans_b { shape = [| nbatch * m; k |]; data = a.data } b ~c;
+      { c with shape = out_shape }
+    end
+    else begin
+      let out = create (nbatch * m * n) in
+      let sta = Layout.broadcast_strides ~src:ba ~out:batch
+      and stb = Layout.broadcast_strides ~src:bb ~out:batch in
+      let offs =
+        Array.init (3 * nbatch) (fun j ->
+            let i = j / 3 in
+            match j mod 3 with
+            | 0 -> Layout.batch_offset ~batch ~strides:sta i * ra * ca
+            | 1 -> Layout.batch_offset ~batch ~strides:stb i * rb * cb
+            | _ -> i * m * n)
+      in
+      gemm_batched_c a.data b.data out
+        [|
+          Bool.to_int trans_a;
+          Bool.to_int trans_b;
+          m;
+          n;
+          k;
+          Int.max 1 ca;
+          Int.max 1 cb;
+          nbatch;
+        |]
+        [| 1.0; 0.0 |] offs;
+      { shape = out_shape; data = out }
+    end
+
+  (* -------------------------------------------------------------------- *)
+  (* The primitives of Tensor_derived                                      *)
+  (* -------------------------------------------------------------------- *)
+
+  let uninit shape = wrap shape (create (numel_of_shape shape))
+
+  let copy_walk_ ~src ~src_offset ~dst ~dst_offset dims ss ds =
+    let n = numel_of_shape dims in
+    if n > 0 then begin
+      let cd, cs = Layout.coalesce dims [| ss; ds |] in
+      let w = pack_walk cd cs and len = cd.(Array.length cd - 1) in
+      let offs = [| src_offset; dst_offset |] in
+      Parallel.parallel_for ~work:len (n / len) (fun lo hi ->
+          copy_walk_c src.data dst.data w offs lo hi)
+    end
+
+  include Tensor_derived.Make (struct
+    type nonrec t = t
+
+    let shape = shape
+    let numel = numel
+    let ndim = ndim
+    let full = full
+    let scalar = scalar
+    let of_array = of_array
+    let copy = copy
+    let reshape = reshape
+    let broadcast_to = broadcast_to
+    let sum_to_shape = sum_to_shape
+    let add = add
+    let sub = sub
+    let mul = mul
+    let scale = scale
+    let pow = pow
+    let exp = exp
+    let log = log
+    let sqrt = sqrt
+    let abs = abs
+    let sum = sum
+    let sum_axis = sum_axis
+    let max_axis = max_axis
+    let max = max
+    let minimum = minimum
+    let maximum = maximum
+    let where = where
+    let mm = matmul
+    let bmm = bmm
+    let uninit = uninit
+    let copy_walk_ = copy_walk_
+  end)
 end
 
 module F64 = Make (struct

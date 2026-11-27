@@ -34,7 +34,8 @@ module type S = sig
   val split : ?rng:Random.State.t -> ratio:float -> t -> t * t
   (** [split ~ratio d] randomly partitions [d] into (first, second) with [ratio]
       of the examples in [first], e.g. a train/validation split. Without [rng]
-      the split differs on every run. *)
+      it draws from the global generator ({!Rng}), so it differs on every run
+      unless {!Rng.manual_seed} was called. *)
 end
 
 (** The module for one backend. *)
@@ -61,9 +62,8 @@ module Make (T : Tensor_intf.S) : S with type tensor = T.t = struct
     done;
     idx
 
-  (** Use the given generator, or seed a fresh one from the system so results
-      differ per run. Pass [~rng] explicitly for reproducible experiments. *)
-  let get_rng = function Some r -> r | None -> Random.State.make_self_init ()
+  (** Use the given generator, or the global default one (see {!Rng}). *)
+  let get_rng = Rng.get
 
   (** Build a sub-dataset from the given row indices (copies the rows). *)
   let take d idx =

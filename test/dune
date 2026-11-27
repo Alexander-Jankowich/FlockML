@@ -13,5 +13,8 @@
   test_optim
   test_conv
   test_kernels
+  test_numpy
   test_backends)
+ (deps
+  (source_tree fixtures))
  (libraries flockml flockml.blas flockml_tests ounit2))

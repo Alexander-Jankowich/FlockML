@@ -31,8 +31,9 @@ let suites_f64 =
   let module O = Flockml_tests.Optim_tests.Make (F64) in
   let module C = Flockml_tests.Conv_tests.Make (F64) in
   let module K = Flockml_tests.Kernel_tests.Make (F64) in
+  let module P = Flockml_tests.Numpy_tests.Make (F64) in
   "suites on Tensor_blas.F64"
-  >::: [ T.suite; A.suite; N.suite; O.suite; C.suite; K.suite ]
+  >::: [ T.suite; A.suite; N.suite; O.suite; C.suite; K.suite; P.suite ]
 
 (** How close a backend must be to the default one. *)
 module type TOLERANCE = sig
@@ -409,9 +410,219 @@ module Agree (B : Flockml.S) (Tol : TOLERANCE) = struct
               params bparams))
       [ `Cnn; `Mlp ]
 
+  (** The NumPy-level API (Phase 7): every op from the same inputs. *)
+  let numpy_api =
+    let x = rand [| 4; 6; 5 |] and pos = rand ~lo:0.1 ~hi:3.0 [| 4; 6; 5 |] in
+    let y = rand [| 6; 5 |] and m = rand [| 6; 1 |] in
+    let ints = Tensor.randint ~rng ~lo:0 ~hi:3 [| 6; 5 |] in
+    let mask = Tensor.gt m (Tensor.scalar 0.) in
+    let idx = [| 5; 0; 0; 3; 2 |] in
+    let gidx = Array.init (4 * 2 * 5) (fun i -> i * 7 mod 6) in
+    let unary name f g =
+      case name (fun ~msg -> close ~msg (f x) (g (into x)))
+    in
+    let on_pos name f g =
+      case name (fun ~msg -> close ~msg (f pos) (g (into pos)))
+    in
+    let same name f g = case name (fun ~msg -> close ~msg (f ()) (g ())) in
+    [
+      unary "abs" Tensor.abs B.Tensor.abs;
+      unary "sign" Tensor.sign B.Tensor.sign;
+      unary "square" Tensor.square B.Tensor.square;
+      on_pos "rsqrt" Tensor.rsqrt B.Tensor.rsqrt;
+      on_pos "log1p" Tensor.log1p B.Tensor.log1p;
+      unary "expm1" Tensor.expm1 B.Tensor.expm1;
+      unary "sin" Tensor.sin B.Tensor.sin;
+      unary "cos" Tensor.cos B.Tensor.cos;
+      unary "tanh" Tensor.tanh B.Tensor.tanh;
+      unary "sigmoid" Tensor.sigmoid B.Tensor.sigmoid;
+      unary "erf" Tensor.erf B.Tensor.erf;
+      unary "clamp"
+        (Tensor.clamp ~min:(-0.3) ~max:0.4)
+        (B.Tensor.clamp ~min:(-0.3) ~max:0.4);
+      case "minimum, maximum, comparisons" (fun ~msg ->
+          close ~msg (Tensor.minimum x y) (B.Tensor.minimum (into x) (into y));
+          close ~msg (Tensor.maximum x m) (B.Tensor.maximum (into x) (into m));
+          List.iter2
+            (fun f g -> close ~msg (f ints m) (g (into ints) (into m)))
+            [ Tensor.eq; Tensor.ne; Tensor.lt; Tensor.le; Tensor.gt; Tensor.ge ]
+            [
+              B.Tensor.eq;
+              B.Tensor.ne;
+              B.Tensor.lt;
+              B.Tensor.le;
+              B.Tensor.gt;
+              B.Tensor.ge;
+            ]);
+      case "where, masked_fill" (fun ~msg ->
+          close ~msg (Tensor.where mask x y)
+            (B.Tensor.where (into mask) (into x) (into y));
+          close ~msg
+            (Tensor.masked_fill x mask 3.)
+            (B.Tensor.masked_fill (into x) (into mask) 3.));
+      case "min_axis, argmin_axis, max, min" (fun ~msg ->
+          close ~msg (Tensor.min_axis x 1) (B.Tensor.min_axis (into x) 1);
+          if Tol.exact_argmax then
+            assert_equal ~msg (Tensor.argmin_axis x 2)
+              (B.Tensor.argmin_axis (into x) 2);
+          close ~msg (Tensor.max x) (B.Tensor.max (into x));
+          close ~msg (Tensor.min x) (B.Tensor.min (into x)));
+      case "mean_axis, sum_axes, prod_axis, cumsum" (fun ~msg ->
+          close ~msg (Tensor.mean_axis x 0) (B.Tensor.mean_axis (into x) 0);
+          close ~msg
+            (Tensor.sum_axes x [ 0; 2 ])
+            (B.Tensor.sum_axes (into x) [ 0; 2 ]);
+          close ~msg (Tensor.prod_axis pos 2) (B.Tensor.prod_axis (into pos) 2);
+          close ~msg (Tensor.cumsum x 1) (B.Tensor.cumsum (into x) 1));
+      case "logsumexp, var, std" (fun ~msg ->
+          close ~msg (Tensor.logsumexp x 1) (B.Tensor.logsumexp (into x) 1);
+          close ~msg
+            (Tensor.var ~correction:1 x 2)
+            (B.Tensor.var ~correction:1 (into x) 2);
+          close ~msg (Tensor.std x 0) (B.Tensor.std (into x) 0));
+      case "permute, slice, flip, pad" (fun ~msg ->
+          close ~msg
+            (Tensor.permute x [| 2; 0; 1 |])
+            (B.Tensor.permute (into x) [| 2; 0; 1 |]);
+          let r = [ Tensor.Step (1, 4, 2); Index 3; Range (-3, 5) ] in
+          close ~msg (Tensor.slice x r) (B.Tensor.slice (into x) r);
+          close ~msg (Tensor.flip x [ 0; 2 ]) (B.Tensor.flip (into x) [ 0; 2 ]);
+          close ~msg
+            (Tensor.pad ~value:2. x [| (1, 0); (0, 2); (3, 1) |])
+            (B.Tensor.pad ~value:2. (into x) [| (1, 0); (0, 2); (3, 1) |]));
+      case "set_slice_" (fun ~msg ->
+          let src = Tensor.slice y [ Step (0, 6, 3) ] in
+          let a = Tensor.copy x and b = into x in
+          Tensor.set_slice_ a [ All; Step (0, 6, 3) ] src;
+          B.Tensor.set_slice_ b [ All; Step (0, 6, 3) ] (into src);
+          close ~msg a b);
+      case "concat, stack, split, chunk" (fun ~msg ->
+          close ~msg
+            (Tensor.concat ~axis:1 [ x; x ])
+            (B.Tensor.concat ~axis:1 [ into x; into x ]);
+          close ~msg
+            (Tensor.stack ~axis:0 [ y; y ])
+            (B.Tensor.stack ~axis:0 [ into y; into y ]);
+          List.iter2 (close ~msg)
+            (Tensor.split x ~axis:1 [ 1; 5 ])
+            (B.Tensor.split (into x) ~axis:1 [ 1; 5 ]);
+          List.iter2 (close ~msg) (Tensor.chunk x ~axis:2 2)
+            (B.Tensor.chunk (into x) ~axis:2 2));
+      case "tile, repeat" (fun ~msg ->
+          close ~msg
+            (Tensor.tile y [| 2; 1; 3 |])
+            (B.Tensor.tile (into y) [| 2; 1; 3 |]);
+          close ~msg
+            (Tensor.repeat y ~axis:0 2)
+            (B.Tensor.repeat (into y) ~axis:0 2));
+      case "index_select, index_add, gather, scatter_add" (fun ~msg ->
+          close ~msg
+            (Tensor.index_select x ~axis:1 idx)
+            (B.Tensor.index_select (into x) ~axis:1 idx);
+          let src = Tensor.index_select x ~axis:1 idx in
+          close ~msg
+            (Tensor.index_add x ~axis:1 idx src)
+            (B.Tensor.index_add (into x) ~axis:1 idx (into src));
+          close ~msg
+            (Tensor.gather x ~axis:1 gidx)
+            (B.Tensor.gather (into x) ~axis:1 gidx);
+          let gsrc = Tensor.gather x ~axis:1 gidx in
+          close ~msg
+            (Tensor.scatter_add x ~axis:1 gidx gsrc)
+            (B.Tensor.scatter_add (into x) ~axis:1 gidx (into gsrc)));
+      case "batched matmul" (fun ~msg ->
+          let a = rand [| 3; 1; 4; 7 |] and b = rand [| 5; 7; 6 |] in
+          close ~msg ~scale:10. (Tensor.matmul a b)
+            (B.Tensor.matmul (into a) (into b));
+          let w = rand [| 7; 6 |] in
+          close ~msg ~scale:10. (Tensor.matmul a w)
+            (B.Tensor.matmul (into a) (into w));
+          let c = rand [| 5; 4; 7 |] in
+          close ~msg ~scale:10.
+            (Tensor.bmm ~trans_a:true ~trans_b:true b c)
+            (B.Tensor.bmm ~trans_a:true ~trans_b:true (into b) (into c));
+          let v = rand [| 7 |] in
+          close ~msg ~scale:10. (Tensor.matmul a v)
+            (B.Tensor.matmul (into a) (into v)));
+      case "dot, outer, norm" (fun ~msg ->
+          let v = rand [| 9 |] and u = rand [| 9 |] in
+          close ~msg (Tensor.dot v u) (B.Tensor.dot (into v) (into u));
+          close ~msg (Tensor.outer v u) (B.Tensor.outer (into v) (into u));
+          List.iter
+            (fun p -> close ~msg (Tensor.norm ~p x) (B.Tensor.norm ~p (into x)))
+            [ 1.; 2.; 3.; Float.infinity ]);
+      same "arange, linspace, eye"
+        (fun () ->
+          Tensor.concat ~axis:0
+            [
+              Tensor.arange ~start:1. ~step:0.25 3.;
+              Tensor.linspace 0. 1. 5;
+              Tensor.reshape (Tensor.eye 3) [| 9 |];
+            ])
+        (fun () ->
+          B.Tensor.concat ~axis:0
+            [
+              B.Tensor.arange ~start:1. ~step:0.25 3.;
+              B.Tensor.linspace 0. 1. 5;
+              B.Tensor.reshape (B.Tensor.eye 3) [| 9 |];
+            ]);
+      same "bernoulli, randint"
+        (fun () ->
+          Tensor.add
+            (Tensor.bernoulli ~rng:(Random.State.make [| 3 |]) ~p:0.4 [| 50 |])
+            (Tensor.randint
+               ~rng:(Random.State.make [| 4 |])
+               ~lo:0 ~hi:9 [| 50 |]))
+        (fun () ->
+          B.Tensor.add
+            (B.Tensor.bernoulli
+               ~rng:(Random.State.make [| 3 |])
+               ~p:0.4 [| 50 |])
+            (B.Tensor.randint
+               ~rng:(Random.State.make [| 4 |])
+               ~lo:0 ~hi:9 [| 50 |]));
+    ]
+
+  (** The gradients of a small causal-attention block, on both backends. *)
+  let attention =
+    let grads (type v t)
+        (module S : Flockml.S with type Var.t = v and type Tensor.t = t) =
+      let qkv =
+        List.map
+          (fun s ->
+            S.Tensor.randn ~rng:(Random.State.make [| s |]) [| 2; 5; 4 |])
+          [ 1; 2; 3 ]
+      in
+      let ps = List.map S.Var.param qkv in
+      let q, k, v =
+        match ps with [ q; k; v ] -> (q, k, v) | _ -> assert false
+      in
+      let causal =
+        S.Tensor.init [| 5; 5 |] (fun i -> if i.(1) > i.(0) then 1. else 0.)
+      in
+      let scores = S.Var.scale 0.5 (S.Var.matmul q (S.Var.swapaxes k 1 2)) in
+      let att = S.Var.softmax (S.Var.masked_fill scores causal (-1e9)) in
+      let out = S.Var.matmul att v in
+      S.Var.backward (S.Var.sum (S.Var.mul out out));
+      List.map
+        (fun p ->
+          let g = S.Var.grad_exn p in
+          Tensor.of_array (S.Tensor.shape g) (S.Tensor.to_array g))
+        ps
+    in
+    [
+      case "causal attention gradients" (fun ~msg ->
+          List.iter2
+            (fun a b -> close ~msg ~scale:10. a (into b))
+            (grads (module Default))
+            (grads (module B)));
+    ]
+
   let suite =
     Tol.name
     >::: [
+           "NumPy-level API" >::: numpy_api;
+           "attention" >::: attention;
            "elementwise and broadcasting" >::: elementwise;
            "unary" >::: unary;
            "reductions" >::: reductions;

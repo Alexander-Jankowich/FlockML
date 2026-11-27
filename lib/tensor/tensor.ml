@@ -22,6 +22,12 @@
 (** A shape plus its elements in row-major order. *)
 type t = { shape : int array; data : float array }
 
+type range = Tensor_intf.range =
+  | All
+  | Index of int
+  | Range of int * int
+  | Step of int * int * int
+
 let[@inline] uget (a : float array) i = Array.unsafe_get a i
 let[@inline] uset (a : float array) i (x : float) = Array.unsafe_set a i x
 
@@ -80,7 +86,8 @@ let allclose ?(rtol = 1e-5) ?(atol = 1e-8) a b =
     !ok
   end
 
-let pp fmt t =
+(** {!pp} with [prec] significant digits per element. *)
+let pp_prec prec fmt t =
   let nd = Array.length t.shape in
   if numel t > 2000 then
     Format.fprintf fmt "tensor %s (%d elements)" (shape_to_string t.shape)
@@ -93,7 +100,7 @@ let pp fmt t =
       if axis = nd - 1 then
         for i = 0 to t.shape.(axis) - 1 do
           if i > 0 then Format.fprintf fmt ", ";
-          Format.fprintf fmt "%.4g" t.data.(offset + i)
+          Format.fprintf fmt "%.*g" prec t.data.(offset + i)
         done
       else begin
         Format.fprintf fmt "@[<v>";
@@ -109,6 +116,9 @@ let pp fmt t =
     go 0 0;
     Format.fprintf fmt "@]"
   end
+
+let pp fmt t = pp_prec 4 fmt t
+let to_string ?(precision = 4) t = Format.asprintf "%a" (pp_prec precision) t
 
 (* ------------------------------------------------------------------------ *)
 (* Indexing                                                                  *)
@@ -140,10 +150,8 @@ let set t idx v = t.data.(flat_index t idx) <- v
 (* Random initialisation                                                      *)
 (* ------------------------------------------------------------------------ *)
 
-(** Unwrap the optional generator, or make a fresh self-seeded one. *)
-let get_rng = function
-  | Some rng -> rng
-  | None -> Random.State.make_self_init ()
+(** Unwrap the optional generator, or take the global default one. *)
+let get_rng = Rng.get
 
 (** Samples from U(lo, hi): one draw per element. *)
 let rand_uniform ?rng ~lo ~hi shape =
@@ -386,8 +394,29 @@ let unary ?(work = 1) t
     arithmetic below uses dedicated loops instead. *)
 let map f t = { shape = Array.copy t.shape; data = Array.map f t.data }
 
-(** The arithmetic operations that {!binop} implements. *)
-type binop = Add | Sub | Mul | Div
+(** The operations that {!binop} implements: arithmetic, NaN-propagating
+    minimum and maximum, and comparisons giving 0/1 masks. *)
+type binop = Add | Sub | Mul | Div | Min | Max | Eq | Ne | Lt | Le | Gt | Ge
+
+(** [1.] if [b], else [0.], without a branch. *)
+let[@inline] float_of_bool b = Float.of_int (Bool.to_int b)
+
+(** One element of the non-arithmetic ops. [Min] and [Max] return [x] when it
+    wins or is NaN, else [y], so a NaN in either operand gives NaN. *)
+let[@inline] apply_binop op (x : float) (y : float) =
+  match op with
+  | Min -> if x < y || x <> x then x else y
+  | Max -> if x > y || x <> x then x else y
+  | Eq -> float_of_bool (x = y)
+  | Ne -> float_of_bool (x <> y)
+  | Lt -> float_of_bool (x < y)
+  | Le -> float_of_bool (x <= y)
+  | Gt -> float_of_bool (x > y)
+  | Ge -> float_of_bool (x >= y)
+  | Add -> x +. y
+  | Sub -> x -. y
+  | Mul -> x *. y
+  | Div -> x /. y
 
 (** One row of a binary op: [o.(oo + i) <- a.(ao + i*sa) op b.(bo + i*sb)].
     Rows where both operands are contiguous get their own loops. *)
@@ -411,6 +440,10 @@ let binop_row op (o : float array) oo (a : float array) ao sa (b : float array)
         for i = 0 to len - 1 do
           uset o (oo + i) (uget a (ao + i) /. uget b (bo + i))
         done
+    | Min | Max | Eq | Ne | Lt | Le | Gt | Ge ->
+        for i = 0 to len - 1 do
+          uset o (oo + i) (apply_binop op (uget a (ao + i)) (uget b (bo + i)))
+        done
   else
     match op with
     | Add ->
@@ -428,6 +461,11 @@ let binop_row op (o : float array) oo (a : float array) ao sa (b : float array)
     | Div ->
         for i = 0 to len - 1 do
           uset o (oo + i) (uget a (ao + (i * sa)) /. uget b (bo + (i * sb)))
+        done
+    | Min | Max | Eq | Ne | Lt | Le | Gt | Ge ->
+        for i = 0 to len - 1 do
+          uset o (oo + i)
+            (apply_binop op (uget a (ao + (i * sa))) (uget b (bo + (i * sb))))
         done
 
 (** A broadcasting binary op. Equal shapes are one flat loop. Otherwise the
@@ -622,44 +660,68 @@ let reduced_shape ~keepdims t axis =
 let[@inline] fmax (acc : float) (v : float) =
   if v > acc || v <> v then v else acc
 
-(** Sum or max along [axis]. Every output element is folded over [k] in
+(** The same, for the minimum. *)
+let[@inline] fmin (acc : float) (v : float) =
+  if v < acc || v <> v then v else acc
+
+(** What {!reduce_axis} computes. *)
+type reduction = Rsum | Rmax | Rmin
+
+(** Sum, max or min along [axis]. Every output element is folded over [k] in
     increasing order, by a single task: the same order as a plain sequential
     loop, so the result doesn't depend on the thread count. When the axis is
     the last one ([inner = 1]) each output is a contiguous run. Otherwise
     whole rows are combined into the output row. *)
-let reduce_axis ~is_max ~keepdims t axis =
+let reduce_axis ~kind ~keepdims t axis =
   let axis =
-    normalize_axis ~fn:(if is_max then "max_axis" else "sum_axis") t axis
+    normalize_axis
+      ~fn:(match kind with Rsum -> "sum_axis" | Rmax -> "max_axis" | Rmin -> "min_axis")
+      t axis
   in
   let outer, n, inner = split_around t axis in
-  let init = if is_max then Float.neg_infinity else 0.0 in
+  let init =
+    match kind with
+    | Rsum -> 0.0
+    | Rmax -> Float.neg_infinity
+    | Rmin -> Float.infinity
+  in
   let out = Array.make (outer * inner) init in
   let x = t.data in
   let block o ilo ihi =
     let base = o * n * inner and ob = o * inner in
     if inner = 1 then begin
       let acc = ref init in
-      if is_max then
-        for k = 0 to n - 1 do
-          acc := fmax !acc (uget x (base + k))
-        done
-      else
-        for k = 0 to n - 1 do
-          acc := !acc +. uget x (base + k)
-        done;
+      (match kind with
+      | Rmax ->
+          for k = 0 to n - 1 do
+            acc := fmax !acc (uget x (base + k))
+          done
+      | Rmin ->
+          for k = 0 to n - 1 do
+            acc := fmin !acc (uget x (base + k))
+          done
+      | Rsum ->
+          for k = 0 to n - 1 do
+            acc := !acc +. uget x (base + k)
+          done);
       uset out ob !acc
     end
     else
       for k = 0 to n - 1 do
         let row = base + (k * inner) in
-        if is_max then
-          for i = ilo to ihi - 1 do
-            uset out (ob + i) (fmax (uget out (ob + i)) (uget x (row + i)))
-          done
-        else
-          for i = ilo to ihi - 1 do
-            uset out (ob + i) (uget out (ob + i) +. uget x (row + i))
-          done
+        match kind with
+        | Rmax ->
+            for i = ilo to ihi - 1 do
+              uset out (ob + i) (fmax (uget out (ob + i)) (uget x (row + i)))
+            done
+        | Rmin ->
+            for i = ilo to ihi - 1 do
+              uset out (ob + i) (fmin (uget out (ob + i)) (uget x (row + i)))
+            done
+        | Rsum ->
+            for i = ilo to ihi - 1 do
+              uset out (ob + i) (uget out (ob + i) +. uget x (row + i))
+            done
       done
   in
   if outer > 1 then
@@ -676,22 +738,29 @@ let reduce_axis ~is_max ~keepdims t axis =
   { shape = reduced_shape ~keepdims t axis; data = out }
 
 let sum_axis ?(keepdims = false) t axis =
-  reduce_axis ~is_max:false ~keepdims t axis
+  reduce_axis ~kind:Rsum ~keepdims t axis
 
 let max_axis ?(keepdims = false) t axis =
-  reduce_axis ~is_max:true ~keepdims t axis
+  reduce_axis ~kind:Rmax ~keepdims t axis
 
-let argmax_axis t axis =
-  let axis = normalize_axis ~fn:"argmax_axis" t axis in
+let min_axis ?(keepdims = false) t axis =
+  reduce_axis ~kind:Rmin ~keepdims t axis
+
+(** The position of the first maximum (or minimum) along [axis]. *)
+let arg_extreme ~fn ~is_min t axis =
+  let axis = normalize_axis ~fn t axis in
   let outer, n, inner = split_around t axis in
   Array.init (outer * inner) (fun j ->
       let o = j / inner and i = j mod inner in
       let at k = t.data.((o * n * inner) + (k * inner) + i) in
       let best = ref 0 in
       for k = 1 to n - 1 do
-        if at k > at !best then best := k
+        if (if is_min then at k < at !best else at k > at !best) then best := k
       done;
       !best)
+
+let argmax_axis t axis = arg_extreme ~fn:"argmax_axis" ~is_min:false t axis
+let argmin_axis t axis = arg_extreme ~fn:"argmin_axis" ~is_min:true t axis
 
 (* ------------------------------------------------------------------------ *)
 (* Matrix multiplication                                                      *)
@@ -915,7 +984,9 @@ let gemm_ ?(trans_a = false) ?(trans_b = false) ?(alpha = 1.0) ?(beta = 0.0) a
          (shape_to_string c.shape))
   in
   if ndim a <> 2 || ndim b <> 2 || ndim c <> 2 then fail ();
-  if c.data == a.data || c.data == b.data then
+  (* Every empty float array is the same value, so only a non-empty c can
+     alias. *)
+  if Array.length c.data > 0 && (c.data == a.data || c.data == b.data) then
     invalid_arg "Tensor.gemm_: c must not share storage with a or b";
   let m, k =
     if trans_a then (a.shape.(1), a.shape.(0)) else (a.shape.(0), a.shape.(1))
@@ -1478,3 +1549,380 @@ let max_pool2d_backward ~grad_out ~argmax ~input_shape =
   end
   else scatter 0 (Array.length argmax);
   { shape = Array.copy input_shape; data = out }
+
+(* ------------------------------------------------------------------------ *)
+(* Elementwise math                                                           *)
+(*                                                                            *)
+(* Defined here, at the end, because several of them (abs, sin, min, max...)  *)
+(* shadow Stdlib names that the code above uses on ints and floats.          *)
+(* ------------------------------------------------------------------------ *)
+
+let abs t =
+  unary t (fun a o lo hi ->
+      for i = lo to hi - 1 do
+        uset o i (Float.abs (uget a i))
+      done)
+
+let sign t =
+  unary t (fun a o lo hi ->
+      for i = lo to hi - 1 do
+        let x = uget a i in
+        uset o i (if x > 0.0 then 1.0 else if x < 0.0 then -1.0 else x)
+      done)
+
+let square t =
+  unary t (fun a o lo hi ->
+      for i = lo to hi - 1 do
+        let x = uget a i in
+        uset o i (x *. x)
+      done)
+
+let rsqrt t =
+  unary ~work:2 t (fun a o lo hi ->
+      for i = lo to hi - 1 do
+        uset o i (1.0 /. Float.sqrt (uget a i))
+      done)
+
+let log1p t =
+  unary ~work:5 t (fun a o lo hi ->
+      for i = lo to hi - 1 do
+        uset o i (Float.log1p (uget a i))
+      done)
+
+let expm1 t =
+  unary ~work:5 t (fun a o lo hi ->
+      for i = lo to hi - 1 do
+        uset o i (Float.expm1 (uget a i))
+      done)
+
+let sin t =
+  unary ~work:5 t (fun a o lo hi ->
+      for i = lo to hi - 1 do
+        uset o i (Float.sin (uget a i))
+      done)
+
+let cos t =
+  unary ~work:5 t (fun a o lo hi ->
+      for i = lo to hi - 1 do
+        uset o i (Float.cos (uget a i))
+      done)
+
+let tanh t =
+  unary ~work:5 t (fun a o lo hi ->
+      for i = lo to hi - 1 do
+        uset o i (Float.tanh (uget a i))
+      done)
+
+(** [1 / (1 + e^-x)] for [x >= 0], and [e^x / (1 + e^x)] otherwise, so the
+    exponential never overflows. *)
+let sigmoid t =
+  unary ~work:5 t (fun a o lo hi ->
+      for i = lo to hi - 1 do
+        let x = uget a i in
+        uset o i
+          (if x >= 0.0 then 1.0 /. (1.0 +. Float.exp (-.x))
+           else
+             let e = Float.exp x in
+             e /. (1.0 +. e))
+      done)
+
+let erf t =
+  unary ~work:5 t (fun a o lo hi ->
+      for i = lo to hi - 1 do
+        uset o i (Float.erf (uget a i))
+      done)
+
+let minimum a b = binop Min a b
+let maximum a b = binop Max a b
+let eq a b = binop Eq a b
+let ne a b = binop Ne a b
+let lt a b = binop Lt a b
+let le a b = binop Le a b
+let gt a b = binop Gt a b
+let ge a b = binop Ge a b
+
+(** All three operands are broadcast to the common shape first (a copy only
+    for those that need it), then one flat pass picks per element. *)
+let where mask a b =
+  let shape = broadcast_shapes (broadcast_shapes mask.shape a.shape) b.shape in
+  let full x = if x.shape = shape then x else broadcast_to x shape in
+  let m = (full mask).data and x = (full a).data and y = (full b).data in
+  let n = numel_of_shape shape in
+  let out = Array.create_float n in
+  Parallel.parallel_for n (fun lo hi ->
+      for i = lo to hi - 1 do
+        uset out i (if uget m i <> 0.0 then uget x i else uget y i)
+      done);
+  { shape; data = out }
+
+(* ------------------------------------------------------------------------ *)
+(* More reductions                                                            *)
+(* ------------------------------------------------------------------------ *)
+
+(** Products along [axis], each over [k] in increasing order. *)
+let prod_axis ?(keepdims = false) t axis =
+  let axis = normalize_axis ~fn:"prod_axis" t axis in
+  let outer, n, inner = split_around t axis in
+  let out = Array.make (outer * inner) 1.0 and x = t.data in
+  Parallel.parallel_for ~work:(n * inner) outer (fun lo hi ->
+      for o = lo to hi - 1 do
+        for k = 0 to n - 1 do
+          let row = ((o * n) + k) * inner and ob = o * inner in
+          for i = 0 to inner - 1 do
+            uset out (ob + i) (uget out (ob + i) *. uget x (row + i))
+          done
+        done
+      done);
+  { shape = reduced_shape ~keepdims t axis; data = out }
+
+let cumsum t axis =
+  let axis = normalize_axis ~fn:"cumsum" t axis in
+  let outer, n, inner = split_around t axis in
+  let out = Array.copy t.data in
+  Parallel.parallel_for ~work:(n * inner) outer (fun lo hi ->
+      for o = lo to hi - 1 do
+        for k = 1 to n - 1 do
+          let row = ((o * n) + k) * inner in
+          for i = 0 to inner - 1 do
+            uset out (row + i) (uget out (row + i) +. uget out (row - inner + i))
+          done
+        done
+      done);
+  { shape = Array.copy t.shape; data = out }
+
+(** The global maximum and minimum: the axis reduction over the data viewed
+    as one axis (no copy). *)
+let max t =
+  reduce_axis ~kind:Rmax ~keepdims:false { t with shape = [| numel t |] } 0
+
+let min t =
+  reduce_axis ~kind:Rmin ~keepdims:false { t with shape = [| numel t |] } 0
+
+(* ------------------------------------------------------------------------ *)
+(* Indexing along an axis                                                    *)
+(* ------------------------------------------------------------------------ *)
+
+(** Raise unless every index lies in [[0, n)]. *)
+let check_indices ~fn idx n =
+  Array.iter
+    (fun i ->
+      if i < 0 || i >= n then
+        invalid_arg
+          (Printf.sprintf "Tensor.%s: index %d out of range for an axis of %d"
+             fn i n))
+    idx
+
+(** [t]'s shape with [axis] resized to [k]. *)
+let resized t axis k =
+  let s = Array.copy t.shape in
+  s.(axis) <- k;
+  s
+
+(** Each output row (of [inner] elements) is one source row: a blit. *)
+let index_select t ~axis idx =
+  let axis = normalize_axis ~fn:"index_select" t axis in
+  let outer, n, inner = split_around t axis in
+  check_indices ~fn:"index_select" idx n;
+  let len = Array.length idx in
+  let out = Array.create_float (outer * len * inner) in
+  Parallel.parallel_for ~work:inner (outer * len) (fun lo hi ->
+      for r = lo to hi - 1 do
+        let o = r / len and j = r mod len in
+        Array.blit t.data
+          (((o * n) + Array.unsafe_get idx j) * inner)
+          out (r * inner) inner
+      done);
+  { shape = resized t axis len; data = out }
+
+(** Tasks own whole outer indices, so repeated indices accumulate in order
+    within one task. *)
+let index_add t ~axis idx src =
+  let axis = normalize_axis ~fn:"index_add" t axis in
+  let outer, n, inner = split_around t axis in
+  let len = Array.length idx in
+  if src.shape <> resized t axis len then
+    invalid_arg
+      (Printf.sprintf "Tensor.index_add: source of shape %s, expected %s"
+         (shape_to_string src.shape)
+         (shape_to_string (resized t axis len)));
+  check_indices ~fn:"index_add" idx n;
+  let out = Array.copy t.data and s = src.data in
+  Parallel.parallel_for ~work:(len * inner) outer (fun lo hi ->
+      for o = lo to hi - 1 do
+        for j = 0 to len - 1 do
+          let d = ((o * n) + Array.unsafe_get idx j) * inner
+          and r = ((o * len) + j) * inner in
+          for i = 0 to inner - 1 do
+            uset out (d + i) (uget out (d + i) +. uget s (r + i))
+          done
+        done
+      done);
+  { shape = Array.copy t.shape; data = out }
+
+(** The number of positions [k] that [idx] gives along [axis], after checking
+    that it divides evenly. *)
+let gather_count ~fn t axis idx =
+  let outer, _, inner = split_around t axis in
+  let m = outer * inner and len = Array.length idx in
+  if (m = 0 && len <> 0) || (m > 0 && len mod m <> 0) then
+    invalid_arg
+      (Printf.sprintf "Tensor.%s: %d indices for a tensor of shape %s" fn len
+         (shape_to_string t.shape));
+  if m = 0 then 0 else len / m
+
+let gather t ~axis idx =
+  let axis = normalize_axis ~fn:"gather" t axis in
+  let outer, n, inner = split_around t axis in
+  let k = gather_count ~fn:"gather" t axis idx in
+  check_indices ~fn:"gather" idx n;
+  let out = Array.create_float (outer * k * inner) and x = t.data in
+  Parallel.parallel_for ~work:(k * inner) outer (fun lo hi ->
+      for o = lo to hi - 1 do
+        for j = 0 to k - 1 do
+          let f = ((o * k) + j) * inner in
+          for i = 0 to inner - 1 do
+            uset out (f + i)
+              (uget x ((((o * n) + Array.unsafe_get idx (f + i)) * inner) + i))
+          done
+        done
+      done);
+  { shape = resized t axis k; data = out }
+
+let scatter_add t ~axis idx src =
+  let axis = normalize_axis ~fn:"scatter_add" t axis in
+  let outer, n, inner = split_around t axis in
+  if ndim src <> ndim t then
+    invalid_arg "Tensor.scatter_add: source and tensor ranks differ";
+  let k = src.shape.(axis) in
+  if src.shape <> resized t axis k || Array.length idx <> numel src then
+    invalid_arg
+      (Printf.sprintf
+         "Tensor.scatter_add: source of shape %s and %d indices for %s"
+         (shape_to_string src.shape) (Array.length idx)
+         (shape_to_string t.shape));
+  check_indices ~fn:"scatter_add" idx n;
+  let out = Array.copy t.data and s = src.data in
+  Parallel.parallel_for ~work:(k * inner) outer (fun lo hi ->
+      for o = lo to hi - 1 do
+        for j = 0 to k - 1 do
+          let f = ((o * k) + j) * inner in
+          for i = 0 to inner - 1 do
+            let d = (((o * n) + Array.unsafe_get idx (f + i)) * inner) + i in
+            uset out d (uget out d +. uget s (f + i))
+          done
+        done
+      done);
+  { shape = Array.copy t.shape; data = out }
+
+(* ------------------------------------------------------------------------ *)
+(* Batched matrix multiply                                                    *)
+(* ------------------------------------------------------------------------ *)
+
+(** When [b] is a single matrix and [a] isn't transposed, [a]'s batches are
+    the rows of one tall matrix, and the whole product is one [gemm_]. Else
+    each batch is a [gemm_] on copies of its two matrices: in parallel over
+    batches when there are enough of them (each [gemm_] then runs
+    sequentially), otherwise one after another with each [gemm_] parallel.
+    Either way every element is summed over [k] in the same order. *)
+let bmm ?(trans_a = false) ?(trans_b = false) a b =
+  let { Layout.rows_a = ra; cols_a = ca; rows_b = rb; cols_b = cb; m; n; k;
+        batch_a = ba; batch_b = bb; batch } =
+    Layout.batched_matmul ~fn:"Tensor.bmm" ~trans_a ~trans_b a.shape b.shape
+  in
+  let nbatch = numel_of_shape batch in
+  let out_shape = Array.append batch [| m; n |] in
+  let out = Array.make (nbatch * m * n) 0.0 in
+  if Array.length bb = 0 && not trans_a then
+    gemm_ ~trans_b
+      { shape = [| nbatch * m; k |]; data = a.data }
+      b
+      ~c:{ shape = [| nbatch * m; n |]; data = out }
+  else if m > 0 && n > 0 then begin
+    let sta = broadcast_strides ~src:ba ~out:batch
+    and stb = broadcast_strides ~src:bb ~out:batch in
+    let one i =
+      let oa = Layout.batch_offset ~batch ~strides:sta i * ra * ca
+      and ob = Layout.batch_offset ~batch ~strides:stb i * rb * cb in
+      let am = { shape = [| ra; ca |]; data = Array.sub a.data oa (ra * ca) }
+      and bm = { shape = [| rb; cb |]; data = Array.sub b.data ob (rb * cb) }
+      and cm = { shape = [| m; n |]; data = Array.create_float (m * n) } in
+      gemm_ ~trans_a ~trans_b am bm ~c:cm;
+      Array.blit cm.data 0 out (i * m * n) (m * n)
+    in
+    if nbatch >= Parallel.num_threads () then
+      Parallel.parallel_for
+        ~work:((m * n * k / 4) + (m * k) + (k * n))
+        nbatch
+        (fun lo hi ->
+          for i = lo to hi - 1 do
+            one i
+          done)
+    else
+      for i = 0 to nbatch - 1 do
+        one i
+      done
+  end;
+  { shape = out_shape; data = out }
+
+(* ------------------------------------------------------------------------ *)
+(* The primitives of Tensor_derived                                          *)
+(* ------------------------------------------------------------------------ *)
+
+let uninit shape =
+  { shape = Array.copy shape; data = Array.create_float (numel_of_shape shape) }
+
+(** A coalesced walk over [dims], one row per task item. Contiguous rows are
+    blits; [Array.blit] also copies correctly when [src] and [dst] are the
+    same array. *)
+let copy_walk_ ~src ~src_offset ~dst ~dst_offset dims ss ds =
+  let n = numel_of_shape dims in
+  if n > 0 then begin
+    let cd, cs = coalesce dims [| ss; ds |] in
+    let last = Array.length cd - 1 in
+    let len = cd.(last) and s = cs.(0).(last) and d = cs.(1).(last) in
+    let sd = src.data and dd = dst.data in
+    Parallel.parallel_for ~work:len (n / len) (fun lo hi ->
+        let offs = [| 0; 0 |] in
+        for_rows cd cs ~lo ~hi offs (fun _ ->
+            let i = src_offset + offs.(0) and o = dst_offset + offs.(1) in
+            if s = 1 && d = 1 then Array.blit sd i dd o len
+            else
+              for j = 0 to len - 1 do
+                uset dd (o + (j * d)) (uget sd (i + (j * s)))
+              done))
+  end
+
+include Tensor_derived.Make (struct
+  type nonrec t = t
+
+  let shape = shape
+  let numel = numel
+  let ndim = ndim
+  let full = full
+  let scalar = scalar
+  let of_array = of_array
+  let copy = copy
+  let reshape = reshape
+  let broadcast_to = broadcast_to
+  let sum_to_shape = sum_to_shape
+  let add = add
+  let sub = sub
+  let mul = mul
+  let scale = scale
+  let pow = pow
+  let exp = exp
+  let log = log
+  let sqrt = sqrt
+  let abs = abs
+  let sum = sum
+  let sum_axis = sum_axis
+  let max_axis = max_axis
+  let max = max
+  let minimum = minimum
+  let maximum = maximum
+  let where = where
+  let mm = matmul
+  let bmm = bmm
+  let uninit = uninit
+  let copy_walk_ = copy_walk_
+end)

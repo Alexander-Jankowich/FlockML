@@ -11,6 +11,7 @@ dune exec --profile release bench/bench_ops.exe       # everything else
 python3 bench/torch_baseline.py                       # PyTorch reference
 python3 bench/numpy_baseline.py                       # NumPy matmul reference
 OPENBLAS_NUM_THREADS=1 python3 bench/numpy_baseline.py  # ...on one thread
+python3 bench/torch_ops.py                            # PyTorch, Phase 7 ops
 ```
 
 Every FlockML benchmark takes `--backend ocaml|blas|blas32` (Phase 5): the
@@ -379,3 +380,68 @@ resolution, so their rows are only rough.
   backends. `max_pool2d` is the one op that got slower. It still returns its
   winning indices as an OCaml `int array` (6.4 MB per call), and allocating
   that on a small heap costs more than the kernel itself.
+
+---
+
+## Phases 7–8: the NumPy-level API and complete autograd (2026-11-26)
+
+Same machine and compiler, 8 threads. These phases add features, not speed,
+so the rule was that nothing may get slower.
+
+### Training is unchanged
+
+Epoch seconds, from the binary built before the change and the one after,
+run alternately (two rounds each):
+
+| Workload | Before | After |
+|---|---|---|
+| MLP, pure OCaml | 0.57, 0.59 | 0.58, 0.59 |
+| CNN, pure OCaml | 4.07, 4.11 | 4.12, 4.12 |
+| MLP, BLAS f64 | 0.21, 0.21 | 0.21, 0.21 |
+| CNN, BLAS f64 | 3.17, 3.11 | 3.14, 3.12 |
+
+Every row of `bench_ops` that existed before is within run-to-run noise on
+both backends, in both directions (for example `add [1M]`: 187 µs before,
+186 µs after).
+
+### The new hot-path ops (µs per call, median)
+
+The `sequence models` group of `bench_ops`, at the shapes of a small
+transformer (batch 32, sequence 64, 4 heads of 32, vocabulary 65), against
+PyTorch 2.0.1 in float64 on all 12 threads (`bench/torch_ops.py`):
+
+| Op | Pure OCaml | BLAS f64 | PyTorch f64 |
+|---|---|---|---|
+| permute [32;64;4;32] -> heads | 79 | 44 | 79 |
+| concat 2x [32;64;128] axis -1 | 215 | 141 | 151 |
+| slice [32;64;128] -> [:, :, 64:] | 39 | 36 | 20 |
+| matmul [32;64;128] x [128;128] | 727 | 123 | 239 |
+| bmm q kᵀ [128;64;32] -> 64x64 | 872 | 251 | 589 |
+| bmm att v [128;64;64] x [..;32] | 761 | 147 | 378 |
+| masked_fill [128;64;64] causal | 514 | 298 | 220 |
+| logsumexp [2048;65] axis -1 | 242 | 213 | 168 |
+| gather [2048;65] one per row | 9 | 287 | 5 |
+| index_select 2048 rows of [65;128] | 63 | 58 | 80 |
+
+### What the numbers say
+
+- **One strided copy covers every structural op.** `permute`, `slice`,
+  `set_slice_`, `flip`, `pad` and `concat` are each a single call to a
+  coalesced, parallel strided copy (`copy_walk_`), written once per backend.
+  They run at memory speed, on par with PyTorch, which also copies when a
+  view is made contiguous.
+- **Batched matmul is fast where it matters.** A batch times a single
+  matrix (a linear layer over a sequence) is one tall `gemm_`. True batches
+  are one CBLAS call per matrix in the BLAS backend, 2–2.5× faster than
+  PyTorch here. In pure OCaml, they are parallel over the batch, with each
+  product sequential.
+- **The composed ops cost a few passes.** `logsumexp` and `masked_fill` are
+  built from other ops (max, subtract, exp, sum, log; broadcast then select),
+  so they make several passes over memory where PyTorch makes one. Fused
+  kernels can replace them once a model's profile shows them.
+- **`gather` is a cold path in the BLAS backend.** It, `scatter_add`,
+  `index_add`, `cumsum` and `prod_axis` convert to the default backend and
+  back, like `map`. At 287 µs, `gather` costs 30× the pure-OCaml version. It
+  needs a C kernel before cross-entropy over a vocabulary uses it in a
+  training loop.
+

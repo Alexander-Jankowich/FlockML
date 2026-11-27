@@ -92,7 +92,8 @@ module type S = sig
   (** Elementwise natural logarithm. *)
 
   val matmul : t -> t -> t
-  (** 2-D matrix product: [[| m; k |]] x [[| k; n |]] -> [[| m; n |]]. *)
+  (** Matrix product with the rules of {!Tensor_intf.S.matmul}: 2-D, batched
+      with broadcasting, or with a 1-D operand. *)
 
   val linear : t -> t -> t -> t
   (** [linear x w b] is [x · w + b] for [x : [| m; k |]], [w : [| k; n |]]
@@ -142,6 +143,178 @@ module type S = sig
   val max_pool2d : t -> size:int -> stride:int -> t
   (** NHWC max pooling over [size] x [size] windows moved by [stride]. The
       gradient flows only to the element that won each window. *)
+
+  (** {2 Elementwise math}
+
+      The same functions as in {!Tensor_intf.S}, differentiable. *)
+
+  val sqrt : t -> t
+  val abs : t -> t
+  (** The gradient at 0 is 0. *)
+
+  val sign : t -> t
+  (** Its gradient is 0 everywhere. *)
+
+  val square : t -> t
+  val rsqrt : t -> t
+  val log1p : t -> t
+  val expm1 : t -> t
+  val sin : t -> t
+  val cos : t -> t
+  val erf : t -> t
+
+  val clamp : ?min:float -> ?max:float -> t -> t
+  (** The gradient passes where [min <= x <= max] and is 0 elsewhere. *)
+
+  val minimum : t -> t -> t
+  (** Broadcasting. The gradient goes to the smaller operand, split in half on
+      ties (as in PyTorch). *)
+
+  val maximum : t -> t -> t
+  (** Like {!minimum}, for the larger operand. *)
+
+  val where : tensor -> t -> t -> t
+  (** [where mask a b]: see {!Tensor_intf.S.where}. The mask is a plain tensor;
+      gradients flow to [a] where it is non-zero and to [b] elsewhere. *)
+
+  val masked_fill : t -> tensor -> float -> t
+  (** See {!Tensor_intf.S.masked_fill}. No gradient flows to the filled
+      positions. *)
+
+  (** {2 Reductions} *)
+
+  val max_axis : ?keepdims:bool -> t -> int -> t
+  (** Maximum along an axis. The gradient goes to the first maximal element of
+      each row. *)
+
+  val min_axis : ?keepdims:bool -> t -> int -> t
+  (** Like {!max_axis}, for the minimum. *)
+
+  val mean_axis : ?keepdims:bool -> t -> int -> t
+  val sum_axes : ?keepdims:bool -> t -> int list -> t
+  val mean_axes : ?keepdims:bool -> t -> int list -> t
+  val var : ?correction:int -> ?keepdims:bool -> t -> int -> t
+  val std : ?correction:int -> ?keepdims:bool -> t -> int -> t
+
+  val softmax : t -> t
+  (** Softmax along the last axis: [exp (log_softmax x)]. *)
+
+  val logsumexp : ?keepdims:bool -> t -> int -> t
+  (** Its gradient is the softmax along that axis. *)
+
+  val cumsum : t -> int -> t
+
+  (** {2 Shapes and indexing}
+
+      All of these copy, like their {!Tensor_intf.S} versions, and route
+      gradients back to the positions they read. *)
+
+  val permute : t -> int array -> t
+  val swapaxes : t -> int -> int -> t
+  val squeeze : ?axis:int -> t -> t
+  val unsqueeze : t -> int -> t
+  val flatten : ?first:int -> ?last:int -> t -> t
+
+  val broadcast_to : t -> int array -> t
+  (** Its gradient sums over the broadcast axes. *)
+
+  val slice : t -> Tensor_intf.range list -> t
+  val narrow : t -> axis:int -> start:int -> len:int -> t
+  val pad : ?value:float -> t -> (int * int) array -> t
+  val flip : t -> int list -> t
+  val concat : axis:int -> t list -> t
+  val stack : axis:int -> t list -> t
+  val split : t -> axis:int -> int list -> t list
+  val chunk : t -> axis:int -> int -> t list
+  val tile : t -> int array -> t
+  val repeat : t -> axis:int -> int -> t
+
+  val index_select : t -> axis:int -> int array -> t
+  (** Its gradient accumulates over repeated indices, as an embedding lookup
+      needs. *)
+
+  val gather : t -> axis:int -> int array -> t
+
+  (** {2 Linear algebra} *)
+
+  val dot : t -> t -> t
+  val outer : t -> t -> t
+
+  val norm : ?p:float -> t -> t
+  (** The gradient of the 2-norm at 0 is NaN. *)
+
+  (** {1 Custom operations} *)
+
+  val custom :
+    name:string ->
+    inputs:t list ->
+    value:tensor ->
+    backward:(tensor -> tensor option list) ->
+    t
+  (** A differentiable operation defined by its forward value and its backward
+      rule, like PyTorch's [torch.autograd.Function]. [value] is the result,
+      computed by the caller from the inputs' values. [backward g], given the
+      gradient [g] of the loss with respect to the result, returns one entry
+      per input: [Some] gradient (of that input's shape) or [None] for no
+      gradient. It is only called during {!backward}, and only if some input
+      requires a gradient. [name] is what {!op_name} and graph exports show.
+
+      Gradients [backward] returns are never updated in place, so it may
+      return [g] itself or share one tensor between inputs. Raises
+      [Invalid_argument] during {!backward} if it returns the wrong number of
+      entries or a gradient of the wrong shape.
+      {[
+        (* GELU, with its exact derivative *)
+        let gelu x =
+          let open Tensor in
+          let v = Var.value x in
+          let cdf = scale 0.5 (add_scalar 1. (erf (scale (1. /. Float.sqrt 2.) v))) in
+          let pdf =
+            scale (1. /. Float.sqrt (2. *. Float.pi)) (exp (scale (-0.5) (square v)))
+          in
+          Var.custom ~name:"gelu" ~inputs:[ x ] ~value:(mul v cdf)
+            ~backward:(fun g -> [ Some (mul g (add cdf (mul v pdf))) ])
+      ]} *)
+
+  (** {1 Gradient utilities} *)
+
+  val set_requires_grad : t -> bool -> unit
+  (** Freeze ([false]) or unfreeze ([true]) a leaf, such as a parameter for
+      fine-tuning: a frozen parameter gets no gradient, and the optimizers
+      skip it. Nodes computed from it before the change are unaffected. Raises
+      [Invalid_argument] for a node that isn't a leaf. *)
+
+  val grad_norm : t list -> float
+  (** The 2-norm of all the nodes' gradients taken together, ignoring nodes
+      without one. *)
+
+  val clip_grad_norm : max_norm:float -> t list -> float
+  (** If the combined gradient norm exceeds [max_norm], scale every gradient
+      by [max_norm / (norm + 1e-6)] in place, as [torch.nn.utils.clip_grad_norm_]
+      does. Returns the norm from before clipping. *)
+
+  val clip_grad_value : float -> t list -> unit
+  (** [clip_grad_value c nodes] limits every gradient element to [[-c, c]]. *)
+
+  val detect_anomaly : (unit -> 'a) -> 'a
+  (** [detect_anomaly f] runs [f] while checking every value computed by a
+      forward operation, and every gradient computed by {!backward}, for NaN
+      and infinity. The first one found raises [Failure] naming the operation,
+      the node and its shape. It costs a pass over each tensor, so use it for
+      debugging only; outside it nothing is checked. *)
+
+  (** {1 Functional API} *)
+
+  val value_and_grad : (t -> t) -> tensor -> float * tensor
+  (** [value_and_grad f x] is [f]'s (scalar) value at [x] and its gradient
+      with respect to [x], in the style of JAX and [torch.func]. Only nodes
+      created during the call count: parameters [f] uses don't receive
+      gradients, so it has no side effects on a model. Works inside
+      {!no_grad}. Raises [Invalid_argument] if [f] doesn't return a scalar. *)
+
+  val gradient : (t -> t) -> tensor -> tensor
+  (** [gradient f x] is the gradient part of {!value_and_grad}: JAX's
+      [grad]. *)
 
   (** {1 Backpropagation} *)
 

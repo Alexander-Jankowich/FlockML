@@ -144,6 +144,48 @@ module Cases (B : Flockml.S) = struct
           Tensor.take_rows train idx);
     ]
 
+  (** The NumPy-level ops a small transformer leans on, at its shapes: batch 32,
+      sequence 64, 4 heads of 32, a vocabulary of 65. *)
+  let sequence =
+    let x = randn [| 32; 64; 128 |] and w = randn [| 128; 128 |] in
+    let heads = randn [| 32; 64; 4; 32 |] in
+    let q = randn [| 128; 64; 32 |] and k = randn [| 128; 64; 32 |] in
+    let att = randn [| 128; 64; 64 |] in
+    let causal =
+      Tensor.init [| 64; 64 |] (fun i -> if i.(1) > i.(0) then 1. else 0.)
+    in
+    let logits = randn [| 2048; 65 |] and emb = randn [| 65; 128 |] in
+    let tokens = Array.init 2048 (fun i -> i * 31 mod 65) in
+    [
+      case "permute [32;64;4;32] -> heads"
+        (numel (Tensor.shape heads))
+        (fun () -> Tensor.permute heads [| 0; 2; 1; 3 |]);
+      case "concat 2x [32;64;128] axis -1"
+        (2 * numel (Tensor.shape x))
+        (fun () -> Tensor.concat ~axis:(-1) [ x; x ]);
+      case "slice [32;64;128] -> [:, :, 64:]"
+        (numel (Tensor.shape x) / 2)
+        (fun () -> Tensor.slice x [ All; All; Range (64, 128) ]);
+      case "matmul [32;64;128] x [128;128]"
+        (numel (Tensor.shape x))
+        (fun () -> Tensor.matmul x w);
+      case "bmm q k^T [128;64;32] -> 64x64"
+        (128 * 64 * 64)
+        (fun () -> Tensor.bmm ~trans_b:true q k);
+      case "bmm att v [128;64;64] x [..;32]"
+        (128 * 64 * 32)
+        (fun () -> Tensor.bmm att q);
+      case "masked_fill [128;64;64] causal"
+        (128 * 64 * 64)
+        (fun () -> Tensor.masked_fill att causal (-1e9));
+      case "logsumexp [2048;65] axis -1" (2048 * 65) (fun () ->
+          Tensor.logsumexp logits (-1));
+      case "gather [2048;65] one per row" (2048 * 65) (fun () ->
+          Tensor.gather logits ~axis:1 tokens);
+      case "index_select 2048 rows of [65;128]" (2048 * 128) (fun () ->
+          Tensor.index_select emb ~axis:0 tokens);
+    ]
+
   let groups =
     [
       ("elementwise", elementwise);
@@ -152,6 +194,7 @@ module Cases (B : Flockml.S) = struct
       ("convolution", convolution);
       ("optimizer", optimizer);
       ("data", data);
+      ("sequence models", sequence);
     ]
 end
 

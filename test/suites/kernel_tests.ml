@@ -567,6 +567,16 @@ module Make (B : Flockml.S) = struct
     let tall = rand_tensor [| 5000; 9 |] and g = rand_tensor [| 5000; 8 |] in
     let big = rand_tensor [| 70000; 8 |] in
     let img = rand_tensor [| 6; 9; 9; 3 |] in
+    let copy_input = rand_tensor [| 6; 70; 9 |] in
+    let index_input = rand_tensor [| 40; 30; 5 |] in
+    let bmm_inputs =
+      ( rand_tensor [| 16; 9; 30 |],
+        rand_tensor [| 16; 30; 7 |],
+        rand_tensor [| 3; 30; 9 |],
+        rand_tensor [| 1; 30; 70 |],
+        rand_tensor [| 4; 50; 30 |],
+        rand_tensor [| 30; 20 |] )
+    in
     [
       same_at_every_thread_count "matmul" (fun () -> [ Tensor.matmul a b ]);
       same_at_every_thread_count "split-k gemm" (fun () ->
@@ -585,6 +595,42 @@ module Make (B : Flockml.S) = struct
             pooled;
           ]);
       same_at_every_thread_count "CNN training steps" train_cnn;
+      same_at_every_thread_count "strided copies" (fun () ->
+          let x = copy_input in
+          let y = Tensor.zeros [| 6; 70; 9 |] in
+          Tensor.set_slice_ y
+            [ Step (1, 6, 2) ]
+            (Tensor.slice x [ Range (0, 3) ]);
+          [
+            Tensor.permute x [| 2; 0; 1 |];
+            Tensor.slice x [ All; Step (3, 70, 4); Index 2 ];
+            Tensor.flip x [ 1 ];
+            Tensor.pad x [| (1, 0); (0, 3); (2, 2) |];
+            Tensor.concat ~axis:1 [ x; x ];
+            y;
+          ]);
+      same_at_every_thread_count "batched matmul, both schedules" (fun () ->
+          let a1, b1, a2, b2, a3, b3 = bmm_inputs in
+          [
+            Tensor.bmm a1 b1;
+            Tensor.bmm ~trans_a:true a2 b2;
+            Tensor.matmul a3 b3;
+          ]);
+      same_at_every_thread_count "indexing and new reductions" (fun () ->
+          let x = index_input in
+          let idx = Array.init 50 (fun i -> i * 7 mod 30) in
+          let gidx = Array.init (40 * 5 * 3) (fun i -> i * 11 mod 30) in
+          [
+            Tensor.index_select x ~axis:1 idx;
+            Tensor.index_add x ~axis:1 idx (Tensor.index_select x ~axis:1 idx);
+            Tensor.gather x ~axis:1 gidx;
+            Tensor.scatter_add x ~axis:1 gidx (Tensor.gather x ~axis:1 gidx);
+            Tensor.cumsum x 1;
+            Tensor.prod_axis x 0;
+            Tensor.min_axis x 1;
+            Tensor.where (Tensor.gt x (Tensor.scalar 0.)) x (Tensor.neg x);
+            Tensor.maximum x (Tensor.scalar 0.1);
+          ]);
     ]
 
   let suite =

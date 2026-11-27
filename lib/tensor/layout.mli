@@ -35,3 +35,33 @@ val coalesce : int array -> int array array -> int array * int array array
     becomes as long as possible, so [[50176; 8] + [8]] becomes 50176 rows of 8,
     and [[64; 128] + [64; 128]] one row of 8192. Always returns at least one
     axis. *)
+
+type batched_matmul = {
+  rows_a : int;  (** the stored rows of each of [a]'s matrices *)
+  cols_a : int;  (** and its stored columns *)
+  rows_b : int;
+  cols_b : int;
+  m : int;  (** rows of each result matrix *)
+  n : int;  (** columns of each result matrix *)
+  k : int;  (** the length of each dot product *)
+  batch_a : int array;  (** [a]'s leading (batch) axes *)
+  batch_b : int array;
+  batch : int array;  (** the broadcast batch shape of the result *)
+}
+(** The shapes of a batched matrix product (see [Tensor_intf.S.bmm]). *)
+
+val batched_matmul :
+  fn:string ->
+  trans_a:bool ->
+  trans_b:bool ->
+  int array ->
+  int array ->
+  batched_matmul
+(** The geometry of [op(a) op(b)] for operands of the given shapes, each with at
+    least 2 axes. Raises [Invalid_argument], naming function [fn], if they can't
+    be multiplied. *)
+
+val batch_offset : batch:int array -> strides:int array -> int -> int
+(** [batch_offset ~batch ~strides i]: where matrix [i] (in row-major order over
+    [batch]) of an operand starts, in matrices, given that operand's
+    {!broadcast_strides} over [batch]. *)

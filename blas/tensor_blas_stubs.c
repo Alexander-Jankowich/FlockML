@@ -42,9 +42,11 @@
 
 /* Operation codes; they must match the ones in tensor_blas.ml. */
 enum { UN_COPY, UN_NEG, UN_SCALE, UN_ADD_SCALAR, UN_POW, UN_EXP, UN_LOG,
-       UN_SQRT, UN_RELU, UN_FILL };
+       UN_SQRT, UN_RELU, UN_FILL, UN_ABS, UN_SIGN, UN_SQUARE, UN_RSQRT,
+       UN_LOG1P, UN_EXPM1, UN_SIN, UN_COS, UN_TANH, UN_SIGMOID, UN_ERF };
 enum { BIN_ADD, BIN_SUB, BIN_MUL, BIN_DIV, BIN_RELU_BACKWARD, BIN_AXPY,
-       BIN_COPY_A };
+       BIN_COPY_A, BIN_MIN, BIN_MAX, BIN_EQ, BIN_NE, BIN_LT, BIN_LE, BIN_GT,
+       BIN_GE };
 
 /* A coalesced walk over a shape (see Layout.coalesce): nd dims, and the
    stride of each of two operands along each dim. */
@@ -281,6 +283,13 @@ CAMLprim value fb_create(value kind, value vn)
 #define LOG log
 #define SQRT sqrt
 #define POW pow
+#define FABS fabs
+#define LOG1P log1p
+#define EXPM1 expm1
+#define SIN sin
+#define COS cos
+#define TANH tanh
+#define ERF erf
 #include "kernels.h"
 #undef T
 #undef K
@@ -288,6 +297,13 @@ CAMLprim value fb_create(value kind, value vn)
 #undef LOG
 #undef SQRT
 #undef POW
+#undef FABS
+#undef LOG1P
+#undef EXPM1
+#undef SIN
+#undef COS
+#undef TANH
+#undef ERF
 
 #define T float
 #define K(name) CAT(name, _s)
@@ -295,6 +311,13 @@ CAMLprim value fb_create(value kind, value vn)
 #define LOG logf
 #define SQRT sqrtf
 #define POW powf
+#define FABS fabsf
+#define LOG1P log1pf
+#define EXPM1 expm1f
+#define SIN sinf
+#define COS cosf
+#define TANH tanhf
+#define ERF erff
 #include "kernels.h"
 #undef T
 #undef K
@@ -302,6 +325,13 @@ CAMLprim value fb_create(value kind, value vn)
 #undef LOG
 #undef SQRT
 #undef POW
+#undef FABS
+#undef LOG1P
+#undef EXPM1
+#undef SIN
+#undef COS
+#undef TANH
+#undef ERF
 
 /* ------------------------------------------------------------------------ */
 /* Dispatch                                                                  */
@@ -385,28 +415,53 @@ CAMLprim value fb_sum_byte(value a, value lo, value hi)
   return caml_copy_double(fb_sum(a, lo, hi));
 }
 
-/* geo = [| n; inner; olo; ohi; ilo; ihi |] */
-CAMLprim value fb_reduce_axis(value is_max, value x, value out, value geo)
+/* mode: 0 sum, 1 max, 2 min. geo = [| n; inner; olo; ohi; ilo; ihi |] */
+CAMLprim value fb_reduce_axis(value mode, value x, value out, value geo)
 {
   const intnat n = Long_val(Field(geo, 0)), inner = Long_val(Field(geo, 1));
   const intnat olo = Long_val(Field(geo, 2)), ohi = Long_val(Field(geo, 3));
   const intnat ilo = Long_val(Field(geo, 4)), ihi = Long_val(Field(geo, 5));
   if (IS_F32(x))
-    reduce_axis_s(Bool_val(is_max), S(x), S(out), n, inner, olo, ohi, ilo, ihi);
+    reduce_axis_s(Int_val(mode), S(x), S(out), n, inner, olo, ohi, ilo, ihi);
   else
-    reduce_axis_d(Bool_val(is_max), D(x), D(out), n, inner, olo, ohi, ilo, ihi);
+    reduce_axis_d(Int_val(mode), D(x), D(out), n, inner, olo, ohi, ilo, ihi);
   return Val_unit;
 }
 
-/* geo = [| n; inner; lo; hi |] */
+/* geo = [| n; inner; lo; hi; is_min |] */
 CAMLprim value fb_argmax_axis(value x, value res, value geo)
 {
   const intnat n = Long_val(Field(geo, 0)), inner = Long_val(Field(geo, 1));
   const intnat lo = Long_val(Field(geo, 2)), hi = Long_val(Field(geo, 3));
-  if (IS_F32(x)) argmax_axis_s(S(x), res, n, inner, lo, hi);
-  else argmax_axis_d(D(x), res, n, inner, lo, hi);
+  const int is_min = (int)Long_val(Field(geo, 4));
+  if (IS_F32(x)) argmax_axis_s(S(x), res, n, inner, lo, hi, is_min);
+  else argmax_axis_d(D(x), res, n, inner, lo, hi, is_min);
   return Val_unit;
 }
+
+/* offs = [| src offset; dst offset |]; rows [rlo, rhi) of the walk. */
+CAMLprim value fb_copy_walk(value src, value dst, value walk, value offs,
+                            value rlo, value rhi)
+{
+  struct walk w;
+  read_walk(walk, &w);
+  const intnat so = Long_val(Field(offs, 0)), dof = Long_val(Field(offs, 1));
+  if (IS_F32(dst))
+    copy_walk_s(S(src), so, S(dst), dof, &w, Long_val(rlo), Long_val(rhi));
+  else
+    copy_walk_d(D(src), so, D(dst), dof, &w, Long_val(rlo), Long_val(rhi));
+  return Val_unit;
+}
+BYTE6(fb_copy_walk)
+
+CAMLprim value fb_select(value m, value a, value b, value o, value lo,
+                         value hi)
+{
+  if (IS_F32(o)) select_s(S(m), S(a), S(b), S(o), Long_val(lo), Long_val(hi));
+  else select_d(D(m), D(a), D(b), D(o), Long_val(lo), Long_val(hi));
+  return Val_unit;
+}
+BYTE6(fb_select)
 
 /* geo = [| m; n |]; rows [rlo, rhi) of the source. */
 CAMLprim value fb_transpose(value src, value dst, value geo, value rlo,
@@ -593,3 +648,51 @@ CAMLprim value fb_gemm(value a, value b, value c, value dims, value coef)
   if (release) caml_leave_blocking_section();
   CAMLreturn(Val_unit);
 }
+
+/* A batch of products c_i <- op(a_i) op(b_i), one gemm per batch. dims =
+   [| ta; tb; m; n; k; lda; ldb; count |], and offs holds, for each batch, the
+   element offsets of a_i, b_i and c_i. c is overwritten (beta = 0). */
+CAMLprim value fb_gemm_batched(value a, value b, value c, value dims,
+                               value coef, value offs)
+{
+  CAMLparam5(a, b, c, dims, coef);
+  CAMLxparam1(offs);
+  const int ta = (int)Long_val(Field(dims, 0)), tb = (int)Long_val(Field(dims, 1));
+  const intnat m = Long_val(Field(dims, 2)), n = Long_val(Field(dims, 3));
+  const intnat k = Long_val(Field(dims, 4));
+  const intnat lda = Long_val(Field(dims, 5)), ldb = Long_val(Field(dims, 6));
+  const intnat count = Long_val(Field(dims, 7));
+  const double alpha = Double_flat_field(coef, 0);
+  const int f32 = IS_F32(c);
+  const size_t es = f32 ? sizeof(float) : sizeof(double);
+  char *pa = Caml_ba_data_val(a), *pb = Caml_ba_data_val(b), *pc = Caml_ba_data_val(c);
+  intnat *off = malloc((size_t)(3 * count + 1) * sizeof(intnat));
+  if (off == NULL) caml_raise_out_of_memory();
+  for (intnat i = 0; i < 3 * count; i++) off[i] = Long_val(Field(offs, i));
+  const int release = (double)count * (double)m * (double)n * (double)k > 32768.0;
+  if (m > 0 && n > 0) {
+    if (release) caml_enter_blocking_section();
+    for (intnat i = 0; i < count; i++) {
+      void *ai = pa + off[3 * i] * es, *bi = pb + off[3 * i + 1] * es;
+      void *ci = pc + off[3 * i + 2] * es;
+#ifdef FLOCKML_HAVE_CBLAS
+      if (k == 0) memset(ci, 0, (size_t)(m * n) * es);
+      else if (f32)
+        cblas_sgemm(CblasRowMajor, ta ? CblasTrans : CblasNoTrans,
+                    tb ? CblasTrans : CblasNoTrans, (int)m, (int)n, (int)k,
+                    (float)alpha, ai, (int)lda, bi, (int)ldb, 0.0f, ci, (int)n);
+      else
+        cblas_dgemm(CblasRowMajor, ta ? CblasTrans : CblasNoTrans,
+                    tb ? CblasTrans : CblasNoTrans, (int)m, (int)n, (int)k,
+                    alpha, ai, (int)lda, bi, (int)ldb, 0.0, ci, (int)n);
+#else
+      if (f32) gemm_fallback_s(ta, tb, m, n, k, alpha, ai, lda, bi, ldb, 0.0, ci);
+      else gemm_fallback_d(ta, tb, m, n, k, alpha, ai, lda, bi, ldb, 0.0, ci);
+#endif
+    }
+    if (release) caml_leave_blocking_section();
+  }
+  free(off);
+  CAMLreturn(Val_unit);
+}
+BYTE6(fb_gemm_batched)

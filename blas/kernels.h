@@ -13,11 +13,31 @@
    for both element types, which for float64 is the same thing.
 
    Required macros: T (the element type), K(name) (appends the suffix),
-   EXP / LOG / SQRT / POW (the libm functions for T). */
+   EXP / LOG / SQRT / POW / FABS / LOG1P / EXPM1 / SIN / COS / TANH / ERF (the
+   libm functions for T). */
 
 /* [x] when it is the new maximum, or NaN: Float.max semantics without its
    signed-zero handling, exactly as fmax in tensor.ml. */
 static inline T K(fmax_nan)(T acc, T v) { return (v > acc || v != v) ? v : acc; }
+static inline T K(fmin_nan)(T acc, T v) { return (v < acc || v != v) ? v : acc; }
+
+/* One element of the binary ops that have no loop of their own: minimum and
+   maximum (NaN-propagating, as apply_binop in tensor.ml) and the
+   comparisons, which give 0 or 1. */
+static inline T K(apply)(int op, T x, T y)
+{
+  switch (op) {
+  case BIN_MIN: return (x < y || x != x) ? x : y;
+  case BIN_MAX: return (x > y || x != x) ? x : y;
+  case BIN_EQ: return (T)(x == y);
+  case BIN_NE: return (T)(x != y);
+  case BIN_LT: return (T)(x < y);
+  case BIN_LE: return (T)(x <= y);
+  case BIN_GT: return (T)(x > y);
+  case BIN_GE: return (T)(x >= y);
+  default: return x;
+  }
+}
 
 /* ------------------------------------------------------------------------ */
 /* Elementwise                                                               */
@@ -66,6 +86,49 @@ static inline T K(fmax_nan)(T acc, T v) { return (v > acc || v != v) ? v : acc; 
   case UN_FILL:                                                             \
     for (i = lo; i < hi; i++) o[i] = kt;                                    \
     break;                                                                  \
+  case UN_ABS:                                                              \
+    for (i = lo; i < hi; i++) o[i] = FABS(A[i]);                            \
+    break;                                                                  \
+  case UN_SIGN:                                                             \
+    for (i = lo; i < hi; i++) {                                             \
+      T x = A[i];                                                           \
+      o[i] = x > 0 ? (T)1 : (x < 0 ? (T)-1 : x);                            \
+    }                                                                       \
+    break;                                                                  \
+  case UN_SQUARE:                                                           \
+    for (i = lo; i < hi; i++) o[i] = A[i] * A[i];                           \
+    break;                                                                  \
+  case UN_RSQRT:                                                            \
+    for (i = lo; i < hi; i++) o[i] = (T)1 / SQRT(A[i]);                     \
+    break;                                                                  \
+  case UN_LOG1P:                                                            \
+    for (i = lo; i < hi; i++) o[i] = LOG1P(A[i]);                           \
+    break;                                                                  \
+  case UN_EXPM1:                                                            \
+    for (i = lo; i < hi; i++) o[i] = EXPM1(A[i]);                           \
+    break;                                                                  \
+  case UN_SIN:                                                              \
+    for (i = lo; i < hi; i++) o[i] = SIN(A[i]);                             \
+    break;                                                                  \
+  case UN_COS:                                                              \
+    for (i = lo; i < hi; i++) o[i] = COS(A[i]);                             \
+    break;                                                                  \
+  case UN_TANH:                                                             \
+    for (i = lo; i < hi; i++) o[i] = TANH(A[i]);                            \
+    break;                                                                  \
+  case UN_SIGMOID: /* as tensor.ml: never exp of a large positive number */ \
+    for (i = lo; i < hi; i++) {                                             \
+      T x = A[i];                                                           \
+      if (x >= 0) o[i] = (T)1 / ((T)1 + EXP(-x));                           \
+      else {                                                                \
+        T e = EXP(x);                                                       \
+        o[i] = e / ((T)1 + e);                                              \
+      }                                                                     \
+    }                                                                       \
+    break;                                                                  \
+  case UN_ERF:                                                              \
+    for (i = lo; i < hi; i++) o[i] = ERF(A[i]);                             \
+    break;                                                                  \
   }
 
 #define BINARY_LOOPS(A)                                                     \
@@ -90,6 +153,9 @@ static inline T K(fmax_nan)(T acc, T v) { return (v > acc || v != v) ? v : acc; 
     break;                                                                  \
   case BIN_COPY_A:                                                          \
     for (i = lo; i < hi; i++) o[i] = A[i];                                  \
+    break;                                                                  \
+  default:                                                                  \
+    for (i = lo; i < hi; i++) o[i] = K(apply)(op, A[i], b[i]);              \
     break;                                                                  \
   }
 
@@ -147,6 +213,9 @@ static inline void K(binary_row)(int op, const T *a, intnat sa, const T *b,
     break;
   case BIN_DIV:
     for (j = 0; j < len; j++) o[j] = a[j * sa] / b[j * sb];
+    break;
+  default:
+    for (j = 0; j < len; j++) o[j] = K(apply)(op, a[j * sa], b[j * sb]);
     break;
   }
 }
@@ -241,20 +310,25 @@ static double K(sum)(const T *a, intnat lo, intnat hi)
   return s;
 }
 
-/* Sum or max along one axis, for outer indices [olo, ohi) and inner
-   indices [ilo, ihi). The tensor is viewed as (outer, n, inner); [out]
-   already holds the initial value (0 or -infinity). The loop order is that
-   of reduce_axis in tensor.ml. */
-static void K(reduce_axis)(int is_max, const T *x, T *out, intnat n,
+/* Sum (mode 0), max (1) or min (2) along one axis, for outer indices
+   [olo, ohi) and inner indices [ilo, ihi). The tensor is viewed as
+   (outer, n, inner); [out] already holds the initial value (0, -infinity or
+   infinity). The loop order is that of reduce_axis in tensor.ml. */
+static void K(reduce_axis)(int mode, const T *x, T *out, intnat n,
                            intnat inner, intnat olo, intnat ohi, intnat ilo,
                            intnat ihi)
 {
+  const int is_max = mode == 1, is_min = mode == 2;
   for (intnat o = olo; o < ohi; o++) {
     const intnat base = o * n * inner, ob = o * inner;
     if (inner == 1) {
       if (is_max) {
         T acc = out[ob];
         for (intnat k = 0; k < n; k++) acc = K(fmax_nan)(acc, x[base + k]);
+        out[ob] = acc;
+      } else if (is_min) {
+        T acc = out[ob];
+        for (intnat k = 0; k < n; k++) acc = K(fmin_nan)(acc, x[base + k]);
         out[ob] = acc;
       } else {
         double acc = out[ob];
@@ -266,6 +340,12 @@ static void K(reduce_axis)(int is_max, const T *x, T *out, intnat n,
         const T *row = x + base + k * inner;
         T *dst = out + ob;
         for (intnat i = ilo; i < ihi; i++) dst[i] = K(fmax_nan)(dst[i], row[i]);
+      }
+    } else if (is_min) {
+      for (intnat k = 0; k < n; k++) {
+        const T *row = x + base + k * inner;
+        T *dst = out + ob;
+        for (intnat i = ilo; i < ihi; i++) dst[i] = K(fmin_nan)(dst[i], row[i]);
       }
     } else {
       /* Columns are summed a tile at a time into double accumulators, still
@@ -285,17 +365,19 @@ static void K(reduce_axis)(int is_max, const T *x, T *out, intnat n,
   }
 }
 
-/* Index of the first maximum along the axis, for every (outer, inner)
-   position j in [lo, hi), written as OCaml ints into [res]. */
+/* Index of the first maximum (or, with is_min, minimum) along the axis,
+   for every (outer, inner) position j in [lo, hi), written as OCaml ints
+   into [res]. */
 static void K(argmax_axis)(const T *x, value res, intnat n, intnat inner,
-                           intnat lo, intnat hi)
+                           intnat lo, intnat hi, int is_min)
 {
   for (intnat j = lo; j < hi; j++) {
     const intnat o = j / inner, i = j % inner;
     const T *p = x + o * n * inner + i;
     intnat best = 0;
     for (intnat k = 1; k < n; k++)
-      if (p[k * inner] > p[best * inner]) best = k;
+      if (is_min ? p[k * inner] < p[best * inner] : p[k * inner] > p[best * inner])
+        best = k;
     Field(res, j) = Val_long(best);
   }
 }
@@ -318,6 +400,50 @@ static void K(transpose)(const T *src, T *dst, intnat m, intnat n,
         for (intnat j = j0; j < j1; j++) dst[j * m + i] = src[i * n + j];
     }
   }
+}
+
+/* Rows [rlo, rhi) of a strided copy (copy_walk_ in tensor.ml): operand 0
+   of the walk is [src], operand 1 is [dst], and both start at an offset.
+   Strides may be negative. memmove, because set_slice_ may copy a tensor
+   onto itself. */
+static void K(copy_walk)(const T *src, intnat soff, T *dst, intnat doff,
+                         const struct walk *w, intnat rlo, intnat rhi)
+{
+  const int nd = w->nd, outer = nd - 1;
+  const intnat len = w->dims[outer];
+  const intnat ss = w->st[0][outer], ds = w->st[1][outer];
+  intnat idx[MAX_DIMS];
+  intnat os = 0, od = 0, r = rlo, j;
+  int ax;
+  for (ax = outer - 1; ax >= 0; ax--) {
+    idx[ax] = r % w->dims[ax];
+    r /= w->dims[ax];
+    os += idx[ax] * w->st[0][ax];
+    od += idx[ax] * w->st[1][ax];
+  }
+  for (r = rlo; r < rhi; r++) {
+    const T *s = src + soff + os;
+    T *d = dst + doff + od;
+    if (ss == 1 && ds == 1) memmove(d, s, (size_t)len * sizeof(T));
+    else for (j = 0; j < len; j++) d[j * ds] = s[j * ss];
+    for (ax = outer - 1; ax >= 0; ax--) {
+      if (++idx[ax] < w->dims[ax]) {
+        os += w->st[0][ax];
+        od += w->st[1][ax];
+        break;
+      }
+      idx[ax] = 0;
+      os -= w->st[0][ax] * (w->dims[ax] - 1);
+      od -= w->st[1][ax] * (w->dims[ax] - 1);
+    }
+  }
+}
+
+/* o[i] = m[i] != 0 ? a[i] : b[i], all four contiguous. */
+static void K(select)(const T *m, const T *a, const T *b, T *o, intnat lo,
+                      intnat hi)
+{
+  for (intnat i = lo; i < hi; i++) o[i] = m[i] != 0 ? a[i] : b[i];
 }
 
 /* dst row r = src row idx[r], for r in [lo, hi). [idx] is an OCaml int

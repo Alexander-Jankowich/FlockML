@@ -90,3 +90,45 @@ let coalesce dims (sts : int array array) =
   done;
   let len = max !len 1 in
   (Array.sub out_dims 0 len, Array.map (fun s -> Array.sub s 0 len) out_sts)
+
+type batched_matmul = {
+  rows_a : int;
+  cols_a : int;
+  rows_b : int;
+  cols_b : int;
+  m : int;
+  n : int;
+  k : int;
+  batch_a : int array;
+  batch_b : int array;
+  batch : int array;
+}
+
+let batched_matmul ~fn ~trans_a ~trans_b sa sb =
+  let na = Array.length sa and nb = Array.length sb in
+  let fail () =
+    invalid_arg
+      (Printf.sprintf "%s: cannot multiply %s%s by %s%s" fn (shape_to_string sa)
+         (if trans_a then "^T" else "")
+         (shape_to_string sb)
+         (if trans_b then "^T" else ""))
+  in
+  if na < 2 || nb < 2 then fail ();
+  let rows_a = sa.(na - 2) and cols_a = sa.(na - 1) in
+  let rows_b = sb.(nb - 2) and cols_b = sb.(nb - 1) in
+  let m, k = if trans_a then (cols_a, rows_a) else (rows_a, cols_a) in
+  let kb, n = if trans_b then (cols_b, rows_b) else (rows_b, cols_b) in
+  if k <> kb then fail ();
+  let batch_a = Array.sub sa 0 (na - 2) and batch_b = Array.sub sb 0 (nb - 2) in
+  let batch =
+    try broadcast_shapes batch_a batch_b with Invalid_argument _ -> fail ()
+  in
+  { rows_a; cols_a; rows_b; cols_b; m; n; k; batch_a; batch_b; batch }
+
+let batch_offset ~batch ~strides i =
+  let r = ref i and off = ref 0 in
+  for ax = Array.length batch - 1 downto 0 do
+    off := !off + (!r mod batch.(ax) * strides.(ax));
+    r := !r / batch.(ax)
+  done;
+  !off

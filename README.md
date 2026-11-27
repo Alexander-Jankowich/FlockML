@@ -1,9 +1,10 @@
 # FlockML
 
 A small PyTorch-like neural network library written from scratch in OCaml.
-It provides n-dimensional tensors, reverse-mode automatic differentiation,
-layers, losses, SGD and Adam optimizers, and a complete MNIST training
-pipeline. The core uses no numerical libraries, only the OCaml standard
+It provides n-dimensional tensors with a NumPy-style API (slicing,
+broadcasting, indexing, batched matmul, `.npy` files), reverse-mode
+automatic differentiation of all of it, custom differentiable ops, layers,
+losses, SGD and Adam optimizers, and a complete MNIST training pipeline. The core uses no numerical libraries, only the OCaml standard
 library. An optional second backend, `flockml.blas`, runs the same code on
 Bigarrays with BLAS, in float64 or float32.
 
@@ -77,12 +78,61 @@ open B
 
 This needs `flockml.blas` in the `libraries` of your dune file.
 
+### NumPy-style arrays
+
+Tensors broadcast, slice, index and reduce the way NumPy arrays do. Every
+operation copies, so a result never shares storage with its input:
+
+```ocaml
+let open Flockml.Tensor in
+let x = reshape (arange 24.) [| 2; 3; 4 |] in
+let y = slice x [ All; Range (1, 3); Step (0, 4, 2) ] in    (* x[:, 1:3, ::2] *)
+let h = permute x [| 0; 2; 1 |] in                           (* axes reordered *)
+let s = logsumexp ~keepdims:true x (-1) in                   (* stable, per row *)
+let m = where (gt x (scalar 10.)) x (zeros_like x) in        (* masks are 0/1 *)
+let b = matmul x (ones [| 4; 5 |]) in                        (* batched: [2; 3; 5] *)
+Flockml.Npy.save "x.npy" x                                   (* numpy.load-able *)
+```
+
+`Flockml.Rng.manual_seed 42` makes every sampler, initialiser, dropout mask
+and shuffle reproducible. In utop, `#install_printer Flockml.Tensor.pp;;`
+prints tensors as nested brackets.
+
+### Custom ops and the functional API
+
+Every tensor op that has a gradient has a `Var` version. An op autograd
+doesn't know can be added with its forward value and backward rule, as
+PyTorch's `torch.autograd.Function` does:
+
+```ocaml
+(* GELU, with its exact derivative *)
+let gelu x =
+  let open Tensor in
+  let v = Var.value x in
+  let cdf = scale 0.5 (add_scalar 1. (erf (scale (1. /. Float.sqrt 2.) v))) in
+  let pdf = scale (1. /. Float.sqrt (2. *. Float.pi)) (exp (scale (-0.5) (square v))) in
+  Var.custom ~name:"gelu" ~inputs:[ x ] ~value:(mul v cdf)
+    ~backward:(fun g -> [ Some (mul g (add cdf (mul v pdf))) ])
+```
+
+And for gradients of plain functions, in the style of JAX:
+
+```ocaml
+let f x = Var.sum (Var.mul x x) in
+let v, g = Var.value_and_grad f (Tensor.of_array [| 2 |] [| 1.; 3. |])
+(* v = 10., g = [2.; 6.]; parameters used inside f are left untouched *)
+```
+
+`Var` also has `set_requires_grad` (to freeze parameters), `clip_grad_norm`
+and `clip_grad_value`, and `detect_anomaly`, which names the first
+operation that produces a NaN or infinity, forward or backward.
+
 ## What's included
 
 | Module | Contents |
 |---|---|
-| `Tensor` | Row-major float tensors: NumPy-style broadcasting, reductions along any axis, a blocked, multithreaded `matmul`/`gemm_`, reshape, random initialisation, fused in-place optimizer updates, and `im2col` / `col2im` / max-pool kernels for convolution |
-| `Var` | Reverse-mode autodiff over 23 primitive ops, including numerically stable `log_softmax` and `sigmoid`, fused `linear` and `softmax_cross_entropy`, and a `no_grad` mode for inference |
+| `Tensor` | Row-major float tensors with a NumPy-level API: broadcasting, slicing and slice assignment, `permute` / `concat` / `stack` / `split` / `pad` / `flip` / `tile`, `index_select` / `gather` / `scatter_add`, comparisons, `where`, 20 elementwise functions, reductions (sum, mean, max, min, prod, var, std, logsumexp, cumsum) along any axes, batched and broadcasting `matmul`, construction (`arange`, `linspace`, `eye`) and sampling. Also a blocked, multithreaded `gemm_`, fused in-place optimizer updates, and `im2col` / `col2im` / max-pool kernels for convolution |
+| `Var` | Reverse-mode autodiff of every tensor op that has a gradient, including numerically stable `log_softmax`, `logsumexp` and `sigmoid`, fused `linear` and `softmax_cross_entropy`, and batched matmul. Also custom ops (`Var.custom`), a functional API (`value_and_grad`, `gradient`), freezing, gradient clipping, anomaly detection, and a `no_grad` mode for inference |
 | `Layer` | `linear`, `conv2d`, `max_pool2d`, `relu`, `sigmoid`, `tanh`, `flatten`, `dropout`, `sequential` |
 | `Loss` | Mean squared error, softmax cross-entropy, binary cross-entropy |
 | `Optim` | SGD (with momentum and weight decay) and Adam (with bias correction) |
@@ -90,10 +140,12 @@ This needs `flockml.blas` in the `libraries` of your dune file.
 | `Dataset` | In-memory datasets, Fisher–Yates shuffling, lazy mini-batches, train/validation splits |
 | `Mnist` | IDX file loader for MNIST and Fashion-MNIST |
 | `Metrics` | Argmax predictions, accuracy, confusion matrices |
+| `Npy` | Read and write NumPy `.npy` files: float64/32, integers and booleans, either byte order, C or Fortran order |
+| `Rng` | The global default random generator, with `manual_seed` and `permutation` |
 | `Graphviz` | Export any computation graph to DOT for visualisation |
 | `Parallel` | A small pool of OCaml 5 domains that the tensor kernels use for data parallelism |
 | `Make`, `S`, `Default` | `Flockml.Make (T)` builds all of the above for a tensor backend `T`. The top-level modules are `Default = Make (Tensor)` |
-| `Layout` | Shape and broadcasting arithmetic shared by the backends |
+| `Layout`, `Tensor_derived` | Shape and broadcasting arithmetic, and the tensor functions written once for every backend (compositions, and every structural op as one strided copy) |
 | `Tensor_blas` (`flockml.blas`) | The optional backend: `F64` and `F32` tensors on Bigarrays, matmul through BLAS (Accelerate or OpenBLAS), every other kernel in vectorised C |
 
 Every public function is documented in its interface: an `.mli`, an
@@ -259,19 +311,20 @@ The interfaces stay simple; the speed comes from how the kernels in
 
 ## Testing
 
-`dune test` runs 669 tests in seven executables, which can also be run one at
-a time. The suites themselves are functors over a backend (`test/suites/`),
+`dune test` runs 1045 tests in eight executables, which can also be run one
+at a time. The suites themselves are functors over a backend (`test/suites/`),
 so the same tests run on both backends:
 
 | Suite | Covers |
 |---|---|
 | `test_tensor` | construction, broadcasting rules, reductions, linear algebra, in-place ops |
-| `test_autograd` | graph mechanics and a gradient check of every elementwise, matrix and reduction op |
+| `test_autograd` | graph mechanics and a gradient check of every differentiable op; custom ops, freezing, clipping, anomaly detection and the functional API |
 | `test_nn` | initialisation statistics, losses, layers, batching, metrics |
 | `test_optim` | SGD, momentum, weight decay and Adam against hand-computed updates |
 | `test_conv` | `im2col`/`col2im` adjointness, gradient checks of `im2col`, `max_pool2d` and a full conv layer, graph export |
 | `test_kernels` | every fast kernel against a plain reference on awkward shapes, gradient checks of the fused ops, gradient-buffer ownership, and bit-identical results at 1, 2, 3 and 8 threads |
-| `test_backends` | all six suites again on `Tensor_blas.F64`, then every op and a few MLP and CNN training steps on both backends, checked to agree (to 1e-11 in float64, 1e-5 in float32) |
+| `test_numpy` | the NumPy-level API against NumPy's own outputs (`.npy` fixtures written by `test/fixtures/gen.py`), plus empty and size-1 axes, NaN rules, errors, the `.npy` reader and the global generator |
+| `test_backends` | all seven suites again on `Tensor_blas.F64`, then every op, a few MLP and CNN training steps and an attention block's gradients on both backends, checked to agree (to 1e-11 in float64, 1e-5 in float32) |
 
 The central tool is the **gradient check** in `test/suites/helpers.ml`. It compares
 every gradient that autograd computes against a central finite difference,
@@ -305,7 +358,8 @@ current goal: [ROADMAP.md](ROADMAP.md) has the plan, and
 | 512² matmul | 1.8 GFLOP/s | 15 GFLOP/s | 106 GFLOP/s | 660 GFLOP/s | 2234 GFLOP/s | NumPy 50 (1 thread), 144 (12) |
 
 The first three columns are the pure-OCaml backend. Phases 1–5 of the
-roadmap are done; Phase 6 (graph replay, fusion, GPU) is next.
+roadmap (speed) and Phases 7–8 (the NumPy-level API and complete autograd)
+are done. Phase 9 (open layers, checkpoints) is next.
 
 ### Benchmarks
 
@@ -347,7 +401,9 @@ lib/
   tensor/
     tensor_intf.ml         module type S: what a numerical backend must provide
     tensor.ml(i)           default backend: row-major float array + shape
+    tensor_derived.ml      the part of S written once, on a few backend primitives
     layout.ml(i)           shape and broadcasting arithmetic, shared by backends
+    rng.ml(i)              the global default generator (manual_seed)
   autograd/
     autograd_intf.ml       module type S: the autograd engine's interface
     autograd.ml            Make (T : Tensor_intf.S): graph ADT + backward pass
@@ -359,6 +415,7 @@ lib/
   data/
     dataset.ml             in-memory dataset, shuffling, lazy mini-batches
     mnist.ml               IDX file loader (MNIST and Fashion-MNIST)
+  io/npy.ml                NumPy .npy reader and writer
   metrics.ml               accuracy, confusion matrix
   viz/graphviz.ml          export a computational graph to DOT
   parallel/parallel.ml(i)  domain pool: parallel_for over disjoint ranges
@@ -374,11 +431,12 @@ test/
   suites/                  one OUnit2 suite per subsystem, as a functor over a backend
   test_*.ml                runs each suite on the default backend
   test_backends.ml         every suite on the BLAS backend, and cross-backend agreement
+  fixtures/                NumPy reference outputs, and gen.py that writes them
 bench/                     training, matmul and per-op benchmarks; PyTorch/NumPy baselines; RESULTS.md
 scripts/download_mnist.sh  dataset download
 ```
 
-Each module in `nn/`, `optim/`, `data/`, `metrics.ml` and `viz/` is a
+Each module in `nn/`, `optim/`, `data/`, `io/`, `metrics.ml` and `viz/` is a
 functor, with its documented signature `S` in the same file.
 
 ## License

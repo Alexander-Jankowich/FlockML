@@ -47,6 +47,9 @@ module type S = sig
   module Metrics : Metrics.S with type tensor = Tensor.t
   (** Predictions, accuracy, confusion matrices. *)
 
+  module Npy : Npy.S with type tensor = Tensor.t
+  (** Reading and writing NumPy [.npy] files. *)
+
   module Graphviz : Graphviz.S with type var = Var.t
   (** Graph export to DOT. *)
 end
@@ -63,6 +66,7 @@ module Make (T : Tensor_intf.S) : S with module Tensor = T = struct
   module Dataset = Dataset.Make (T)
   module Mnist = Mnist.Make (T) (Dataset)
   module Metrics = Metrics.Make (T)
+  module Npy = Npy.Make (T)
   module Graphviz = Graphviz.Make (T) (Var)
 end
 
@@ -72,7 +76,11 @@ module Tensor_intf = Tensor_intf
 module Autograd_intf = Autograd_intf
 module Autograd = Autograd
 module Layout = Layout
+module Tensor_derived = Tensor_derived
 module Parallel = Parallel
+module Rng = Rng
+
+let manual_seed = Rng.manual_seed
 
 (** {1 The default stack}
 
@@ -88,4 +96,5 @@ module Optim = Default.Optim
 module Dataset = Default.Dataset
 module Mnist = Default.Mnist
 module Metrics = Default.Metrics
+module Npy = Default.Npy
 module Graphviz = Default.Graphviz
